@@ -3,6 +3,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <limits.h>
+#include <pthread.h>
+#include <sys/mman.h>
 #include "kthread.h"
 #include "khashl.h"
 #include "kseq.h"
@@ -84,7 +87,11 @@ yak_bf_t *yak_bf_init(int n_shift, int n_hashes)
 	CALLOC(b, 1);
 	b->n_shift = n_shift;
 	b->n_hashes = n_hashes;
-	posix_memalign(&ptr, 1<<(YAK_BLK_SHIFT-3), 1ULL<<(n_shift-3));
+	///the large filters (16 GB of random inserts in the filter pass) aligned to 2 MB: with THP enabled
+	///they get 2 MB pages when the kernel has free ones. No MADV_HUGEPAGE: with defrag=madvise it makes
+	///the kernel compact memory for them, which costs more than it gives on a fragmented host.
+	if (n_shift - 3 >= 21) posix_memalign(&ptr, 1ULL<<21, 1ULL<<(n_shift-3));
+	else posix_memalign(&ptr, 1<<(YAK_BLK_SHIFT-3), 1ULL<<(n_shift-3));
 	b->b = (uint8_t*)ptr;
 	bzero(b->b, 1ULL<<(n_shift-3));
 	return b;
@@ -115,6 +122,14 @@ int yak_bf_insert(yak_bf_t *b, uint64_t hash)
 	return cnt;
 }
 
+///prefetch the block of yak_bf_insert(b, hash): no change of the filter
+static inline void yak_bf_prefetch(const yak_bf_t *b, uint64_t hash)
+{
+	int x = b->n_shift - YAK_BLK_SHIFT;
+	uint64_t y = hash & ((1ULL<<x) - 1);
+	__builtin_prefetch(&b->b[y<<(YAK_BLK_SHIFT-3)], 1);
+}
+
 /********************
  * Count hash table *
  ********************/
@@ -133,10 +148,42 @@ typedef struct {
 	uint64_t tot;  ///number of distinct k-mers
 	uint64_t bs;
 	ha_ct1_t *h;
+	void *bf_map; uint64_t bf_map_n; ///the one mapping of all bloom filters (ha_ct_init()), or NULL
 } ha_ct_t;
 
 ///for 0-th counting, k = 51, pre = 12, n_hash = 4, n_shift = 37
 ///for 1-th counting, opt.k = 51, opt->pre = 12, opt->bf_n_hash = 4, opt.bf_shift = 0
+///the 4096 bloom filters of a count table take 2^(n_shift-3) bytes together (16 GB for n_shift = 37).
+///They are slices of one anonymous mapping, 2 MB-aligned: a mmap() or munmap() per filter takes the
+///address-space lock for writing and stalls the page faults of all other threads (T1: 0.8 s at about
+///4 busy cores). The mapping is zero; the workers fault the pages in parallel with one write per 4 KB,
+///and at the end free them in parallel (MADV_DONTNEED) before the one munmap(). The contents are the
+///same as with yak_bf_init().
+static void ha_ct_bf_init_worker(void *data, long i, int tid)///callback for kt_for()
+{
+	ha_ct_t *h = (ha_ct_t*)data;
+	uint64_t j, n = 1ULL<<(h->n_shift - h->pre - 3);
+	yak_bf_t *b;
+	CALLOC(b, 1);
+	b->n_shift = h->n_shift - h->pre;
+	b->n_hashes = h->n_hash;
+	b->b = (uint8_t*)(((uintptr_t)h->bf_map + (1ULL<<21) - 1) & ~(uintptr_t)((1ULL<<21) - 1)) + (uint64_t)i * n;
+	for (j = 0; j < n; j += 4096) b->b[j] = 0;
+	h->h[i].b = b;
+}
+
+static void ha_ct_bf_destroy_worker(void *data, long i, int tid)///callback for kt_for()
+{
+	ha_ct_t *h = (ha_ct_t*)data;
+	if (h->h[i].b) {
+		if (h->bf_map) {///a slice of the mapping: free its pages now, the mapping after the kt_for()
+			madvise(h->h[i].b->b, 1ULL<<(h->n_shift - h->pre - 3), MADV_DONTNEED);
+			free(h->h[i].b);
+		} else yak_bf_destroy(h->h[i].b);
+	}
+	h->h[i].b = 0;
+}
+
 static ha_ct_t *ha_ct_init(int k, int pre, int n_hash, int n_shift)
 {
 	ha_ct_t *h;
@@ -152,20 +199,26 @@ static ha_ct_t *ha_ct_init(int k, int pre, int n_hash, int n_shift)
 	///for 0-th counting, enter here; used for bloom filter
 	if (n_hash > 0 && n_shift > h->pre) {
 		h->n_hash = n_hash, h->n_shift = n_shift;
-		for (i = 0; i < 1<<h->pre; ++i)
-			h->h[i].b = yak_bf_init(h->n_shift - h->pre, h->n_hash); ///h->n_shift = 37, h->pre = 12, h->n_hash = 4 
+		///h->n_shift = 37, h->pre = 12, h->n_hash = 4 
+		///the bounds of yak_bf_init(): else there are no filters, as there
+		if (n_shift - h->pre + YAK_BLK_SHIFT <= 64 && n_shift - h->pre >= YAK_BLK_SHIFT) {
+			h->bf_map_n = (1ULL<<(n_shift - 3)) + (1ULL<<21);
+			h->bf_map = mmap(0, h->bf_map_n, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+			if (h->bf_map == MAP_FAILED) {
+				fprintf(stderr, "[E::%s] cannot map %llu bytes for the bloom filters\n", __func__, (unsigned long long)h->bf_map_n);
+				exit(1);
+			}
+			kt_for(asm_opt.thread_num > 0? asm_opt.thread_num : 1, ha_ct_bf_init_worker, h, 1<<h->pre);
+		}
 	}
 	return h;
 }
 
 static void ha_ct_destroy_bf(ha_ct_t *h)
 {
-	int i;
-	for (i = 0; i < 1<<h->pre; ++i) {
-		if (h->h[i].b)
-			yak_bf_destroy(h->h[i].b);
-		h->h[i].b = 0;
-	}
+	kt_for(asm_opt.thread_num > 0? asm_opt.thread_num : 1, ha_ct_bf_destroy_worker, h, 1<<h->pre);
+	if (h->bf_map) munmap(h->bf_map, h->bf_map_n);
+	h->bf_map = 0; h->bf_map_n = 0;
 }
 
 static void ha_ct_destroy(ha_ct_t *h)
@@ -178,6 +231,7 @@ static void ha_ct_destroy(ha_ct_t *h)
 	free(h->h); free(h);
 }
 
+#define HA_BF_PREFETCH 16 ///the bloom block of the k-mer HA_BF_PREFETCH ahead
 static int ha_ct_insert_list(ha_ct_t *h, int create_new, int n, const uint64_t *a)
 {
 	int j, mask = (1<<h->pre) - 1, n_ins = 0;
@@ -187,6 +241,7 @@ static int ha_ct_insert_list(ha_ct_t *h, int create_new, int n, const uint64_t *
 	g = &h->h[a[0]&mask];
 	for (j = 0; j < n; ++j) {
 		int ins = 1, absent;
+		if (create_new && g->b && j + HA_BF_PREFETCH < n) yak_bf_prefetch(g->b, a[j + HA_BF_PREFETCH] >> h->pre);///a random block for each k-mer
 		///x is a 64-bit word, h->pre=12
 		///all elements at a have the same low 12 bits
 		///so low 12 bits are not useful
