@@ -19243,6 +19243,19 @@ inline int64_t detect_near_cc_tlen(bit_extz_t *ez, int64_t ck0, int64_t xk0, int
 }
 
 ///[s, e)
+///the first t in [t, oe) with f[t-s] != 0, else oe; 8 bytes at a time (little-endian: the lowest
+///nonzero byte is the first one)
+static inline int64_t hc_next_nz(const uint8_t *f, int64_t t, int64_t oe, int64_t s)
+{
+    uint64_t w;
+    for (; t + 8 <= oe; t += 8) {
+        memcpy(&w, f + (t - s), 8);
+        if (w) return t + (__builtin_ctzll(w) >> 3);
+    }
+    while (t < oe && !f[t-s]) t++;
+    return t;
+}
+
 int64_t extract_sub_cigar_hc(overlap_region *z, All_reads *rref, haplotype_evdience_alloc* hp, char *qstr, uint64_t ql, UC_Read* tu, int64_t s, int64_t e, ul_ov_t *p, int64_t set_f, uint8_t *f, uint8_t occ_thres, uint64_t hpc_len/**, uint8_t is_dbg**/)
 {
     // fprintf(stderr, "\n[M::%s]\ts::%ld\te::%ld\tset_f::%ld\tovlp_id::%u\twid::%u\n", __func__, s, e, set_f, ovlp_id(*p), ovlp_cur_wid(*p));
@@ -19311,7 +19324,7 @@ int64_t extract_sub_cigar_hc(overlap_region *z, All_reads *rref, haplotype_evdie
             }
         } else {
             if(op == 0) {
-                for (t = os; t < oe; t++) {
+                for (t = hc_next_nz(f, os, oe, s); t < oe; t = hc_next_nz(f, t+1, oe, s)) {///only the t with f[t-s] != 0
                     if(f[t-s]) {
                         om = ((f[t-s]==3)?1:0);
                         ev.misBase = qstr[t];
@@ -19324,7 +19337,7 @@ int64_t extract_sub_cigar_hc(overlap_region *z, All_reads *rref, haplotype_evdie
                     }
                 }
             } else if(op == 1) {
-                for (t = os; t < oe; t++) {
+                for (t = hc_next_nz(f, os, oe, s); t < oe; t = hc_next_nz(f, t+1, oe, s)) {///only the t with f[t-s] != 0
                     if(f[t-s]) {
                         if(!ystr) {
                             // yk0 = ((hpc_len)?(detect_near_cc_tlen(&ez, ck, xk, yk, 1)):(t-xk+yk));
