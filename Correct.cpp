@@ -17,10 +17,86 @@
 #include "Overlaps.h"
 #include "inter.h"
 #include "Process_Read.h"
+#ifdef HA_C3_PEQ_CHECK
+uint64_t hc_c3_peq_checks[4], hc_c3_peq_bad;
+static void hc_c3_peq_report(void)
+{
+    fprintf(stderr, "[M::HA_C3_PEQ_CHECK] global: %lu; ext0: %lu; ext1: %lu; semi: %lu; different: %lu\n",
+        (unsigned long)hc_c3_peq_checks[0], (unsigned long)hc_c3_peq_checks[1],
+        (unsigned long)hc_c3_peq_checks[2], (unsigned long)hc_c3_peq_checks[3], (unsigned long)hc_c3_peq_bad);
+}
+static int hc_c3_peq_report_set = atexit(hc_c3_peq_report);
+#endif
+#ifdef HA_D_PEQ_CHECK
+uint64_t hc_d_peq_checks[1], hc_d_peq_bad[1];
+static void hc_d_peq_report(void)
+{
+    fprintf(stderr, "[M::HA_D_PEQ_CHECK] semi: %lu/%lu (calls/different)\n",
+        (unsigned long)hc_d_peq_checks[0], (unsigned long)hc_d_peq_bad[0]);
+}
+static int hc_d_peq_report_set = atexit(hc_d_peq_report);
+#endif
+#ifdef HA_D_TRACE_CHECK
+uint64_t hc_d_trace_calls[2], hc_d_trace_words, hc_d_trace_state_bad, hc_d_trace_bad;
+static void hc_d_trace_report(void)
+{
+    fprintf(stderr, "[M::HA_D_TRACE_CHECK] single: %lu; multi: %lu; words: %lu; state differences: %lu; result differences: %lu\n",
+        (unsigned long)hc_d_trace_calls[0], (unsigned long)hc_d_trace_calls[1], (unsigned long)hc_d_trace_words,
+        (unsigned long)hc_d_trace_state_bad, (unsigned long)hc_d_trace_bad);
+}
+static int hc_d_trace_report_set = atexit(hc_d_trace_report);
+#endif
 #define A_L 16
 #define ext_w 6
 #define r_simi_w 0.05
 #define rphase_thres 4
+
+#ifdef HA_TB8_CHECK
+static uint64_t ha_tb8_requested = 0, ha_tb8_batched = 0, ha_tb8_bad = 0, ha_tb8_batches = 0;
+static void ha_tb8_report(void)
+{
+    fprintf(stderr, "[M::ha_tb8_check] batched windows: %lu; different: %lu; requested: %lu; fraction: %.6f; lanes/batch: %.3f\n",
+        (unsigned long)ha_tb8_batched, (unsigned long)ha_tb8_bad, (unsigned long)ha_tb8_requested,
+        ha_tb8_requested? (double)ha_tb8_batched / ha_tb8_requested : 0.0,
+        ha_tb8_batches? (double)ha_tb8_batched / ha_tb8_batches : 0.0);
+}
+static int ha_tb8_report_set = atexit(ha_tb8_report);
+#endif
+
+typedef struct {
+    size_t n;
+    w_sig *a;
+    char *pstr;
+    int32_t done;
+} hc_tb8_path_t;
+
+///Use the existing traceback on the lane's scalar-layout words; a dead lane returned before gen_trace().
+static void hc_tb8_gen_trace(char *pstr, int32_t pn, char *tstr, int32_t tn, int32_t thre,
+    int32_t abs_diag, bit_extz_t *ez, const hc_tb8_path_t *tb)
+{
+#ifdef HA_TB8_CHECK
+    bit_extz_t ref = *ez;
+    memset(&ref.path, 0, sizeof(ref.path)); memset(&ref.cigar, 0, sizeof(ref.cigar));
+    ed_band_cal_semi_64_w_absent_diag_trace(pstr, pn, tstr, tn, thre, abs_diag, &ref);
+#endif
+    ez->cigar.n = 0; ez->nword = 1;
+    kv_resize(w_sig, ez->path, tb->n); ez->path.n = tb->n;
+    if (tb->n) memcpy(ez->path.a, tb->a, tb->n * sizeof(*tb->a));
+    if (tb->done) gen_trace(ez, abs_diag, 1);
+#ifdef HA_TB8_CHECK
+    int bad = ref.err != ez->err || ref.ps != ez->ps || ref.pe != ez->pe || ref.pl != ez->pl ||
+        ref.ts != ez->ts || ref.te != ez->te || ref.tl != ez->tl || ref.thre != ez->thre ||
+        ref.nword != ez->nword || ref.mword != ez->mword || ref.m != ez->m || ref.mm_thres != ez->mm_thres ||
+        ref.done_cigar != ez->done_cigar || ref.done_path != ez->done_path ||
+        ref.cigar_n != ez->cigar_n || ref.path_n != ez->path_n || ref.path.n != ez->path.n ||
+        ref.cigar.n != ez->cigar.n;
+    if (!bad && ref.path.n) bad = memcmp(ref.path.a, ez->path.a, ref.path.n * sizeof(*ref.path.a)) != 0;
+    if (!bad && ref.cigar.n) bad = memcmp(ref.cigar.a, ez->cigar.a, ref.cigar.n * sizeof(*ref.cigar.a)) != 0;
+    __sync_fetch_and_add(&ha_tb8_batched, 1);
+    if (bad) __sync_fetch_and_add(&ha_tb8_bad, 1);
+    free(ref.path.a); free(ref.cigar.a);
+#endif
+}
 
 #define generic_key(x) (x)
 KRADIX_SORT_INIT(b32, uint32_t, generic_key, 4)
