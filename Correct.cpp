@@ -13024,65 +13024,402 @@ uint32_t align_ul_ed_post_extz(overlap_region *z, const ul_idx_t *uref, hpc_t *h
 }
 
 
-uint32_t align_hc_ed_post_extz(overlap_region *z, All_reads *rref, char* qstr, char *tstr, bit_extz_t *exz, double e_rate, int64_t w_l, double ovlp_cut, int64_t force_aln, void *km)
+///1 if q[0, l) equals t[0, l) and has no N; ed_band_* scores N as a mismatch
+static inline uint32_t is_exact_win(const char *q, const char *t, int64_t l)
 {
-    int64_t q_s, q_e, nw, k, q_l, t_l, t_tot_l, aux_beg, aux_end, t_s, thre, aln_l, t_pri_l;
-    char *q_string, *t_string; 
-    z->w_list.n = 0; z->is_match = 0; z->align_length = 0;
-    nw = get_num_wins(z->x_pos_s, z->x_pos_e+1, w_l);
-    get_win_se_by_normalize_xs(z, (z->x_pos_s/w_l)*w_l, w_l, &q_s, &q_e);
-    // if(z->x_id == 19350 && z->y_id == 19324) {
-    //     fprintf(stderr, "-z-[M::%s] tid::%u(%c)\tq::[%u,%u)\tt::[%u,%u)\n", __func__, z->y_id, "+-"[z->y_pos_strand], z->x_pos_s, z->x_pos_e+1, z->y_pos_s, z->y_pos_e+1);
-    // }
-    for (k = 0; k < nw; k++) {
-        aux_beg = aux_end = 0; q_l = 1 + q_e - q_s;
-        thre = q_l*e_rate; thre = Adjust_Threshold(thre, q_l);
-        if(thre > THRESHOLD_MAX_SIZE) thre = THRESHOLD_MAX_SIZE;
-        ///offset of y
-        t_s = (q_s - z->x_pos_s) + z->y_pos_s;
-        t_s += y_start_offset(q_s, &(z->f_cigar));
+    return (memcmp(q, t, l) == 0) && (memchr(q, 'N', l) == NULL);
+}
 
-        aln_l = q_l + (thre<<1); t_tot_l = Get_READ_LENGTH((*rref), z->y_id); 
-        if(init_waln(thre, t_s, t_tot_l, aln_l, &aux_beg, &aux_end, &t_s, &t_pri_l)) {
-            q_string = qstr+q_s; 
-            recover_UC_Read_sub_region(tstr, t_s, t_pri_l, z->y_pos_strand, rref, z->y_id); t_string = tstr;
-            // t_string = return_str_seq_exz(tstr, t_s, t_pri_l, z->y_pos_strand, hpc_g, uref, z->y_id);
-            
-            t_l = t_pri_l;
-            // t_end = Reserve_Banded_BPM(t_string, aln_l, q_string, q_l, thre, &error);
-            ed_band_cal_semi_64_w_absent_diag(t_string, t_l, q_string, q_l, thre, aux_beg, exz);
+///the result of ed_band_cal_semi_64_w_absent_diag() for a window with abs_diag == 0, a target of
+///q_l + 2*thre bases, and a query that is equal to the target on the central diagonal: no error,
+///and the central diagonal wins the ties
+static inline void set_exact_semi_win(bit_extz_t *exz, int64_t thre, int64_t t_l, int64_t q_l)
+{
+    init_base_ed(*exz, thre, t_l, q_l); exz->ps = -1; exz->ts = 0; exz->te = q_l - 1;
+    exz->err = 0; exz->pe = q_l - 1 + thre;
+}
 
-            // if(z->x_id == 5569 && z->y_id == 5557 && q_s == 10075 && q_e == 10849) {
-            //     fprintf(stderr, "\n[M::%s::semi::t_s->%ld::t_pri_l->%ld::aux_beg->%ld::aux_end->%ld::thre->%ld] exz->ps::%d, exz->pe::%d, exz->ts::%d, exz->te::%d, exz->err::%d, exz->cigar.n::%d, thre::%ld\n", 
-            //     __func__, t_s, t_pri_l, aux_beg, aux_end, thre, exz->ps, exz->pe, exz->ts, exz->te, exz->err, (int32_t)exz->cigar.n, thre);
-            //     fprintf(stderr, "[tstr::len->%ld] %.*s\n", t_l, (int32_t)t_l, t_string);
-            //     fprintf(stderr, "[qstr::len->%ld] %.*s\n", q_l, (int32_t)q_l, q_string);
-            // } 
-            if (is_align(*exz)) {
-                // ed_band_cal_semi_64_w(t_string, aln_l, q_string, q_l, thre, exz);
-                // assert(exz->err <= exz->thre);
-                // if(z->x_id == 19350 && z->y_id == 19324) {
-                //     fprintf(stderr, "+[M::%s]\tq::[%ld,%ld)\tt::[%ld,%ld)\texz->err::%d\n", __func__, q_s, q_e + 1, t_s, t_s + exz->pe + 1, exz->err);
-                // }
-                ///t_s do not have aux_beg, while t_s + t_end (aka, te) has 
-                if(!push_hc_wlst_exz(NULL, NULL, rref, z, qstr, tstr, exz, THRESHOLD_MAX_SIZE, q_s, q_e, t_s, t_s + exz->pe, 
-                                        t_tot_l, aux_beg, aux_end, e_rate, w_l, ovlp_cut, force_aln, km)) {
-                    return 0;
-                }
-                // append_window_list(z, q_s, q_e, t_s, t_s + t_end, error, aux_beg, aux_end, thre, w_l, km);
-            } 
-            // else {
-                // if(z->x_id == 19350 && z->y_id == 19324) {
-                //     fprintf(stderr, "-[M::%s]\tq::[%ld,%ld)\tt::[%ld,%ld)\texz->err::%d\n", __func__, q_s, q_e + 1, t_s, t_s + exz->pe + 1, exz->err);
-                // }
-            // }
+
+///1 if a window (abs_diag == 0, a target t of q_l + 2*thre bases, thre >= 1) has the result err 1 at the
+///central end in ed_band_cal_semi_64_w_absent_diag(): the query q differs from the central diagonal of t
+///at exactly one base, without N in either, so the minimum of the last row is at most 1 and the central
+///end has 1 (only the central diagonal reaches it without an indel); the kernel takes the central end
+///on a tie. The minimum is 0 only at the end of a diagonal that holds q exactly: no such diagonal.
+static inline int is_one_mismatch_win(const char *q, const char *t, int64_t q_l, int64_t thre)
+{
+    int64_t i, d, mm = 0; uint64_t a, b, x, q8;
+    const char *tc = t + thre;
+    if (thre < 1 || q_l < 8) return 0;
+    for (i = 0; i + 8 <= q_l; i += 8) {
+        memcpy(&a, q + i, 8); memcpy(&b, tc + i, 8);
+        x = a ^ b;
+        if (x) {///the count of bytes that differ
+            x |= x >> 4; x |= x >> 2; x |= x >> 1;
+            mm += __builtin_popcountll(x & 0x0101010101010101ULL);
+            if (mm > 1) return 0;
         }
-        q_s = q_e + 1; q_e = q_s + w_l - 1; 
-        if(q_e >= (int64_t)z->x_pos_e) q_e = z->x_pos_e;
+    }
+    for (; i < q_l; i++)
+        if (q[i] != tc[i] && ++mm > 1) return 0;
+    if (mm != 1 || memchr(q, 'N', q_l) || memchr(tc, 'N', q_l)) return 0;
+    memcpy(&q8, q, 8);
+    for (d = 0; d <= (thre<<1); d++) {///no other diagonal holds q exactly (8 bytes first)
+        if (d == thre) continue;
+        memcpy(&a, t + d, 8);
+        if (a == q8 && memcmp(q, t + d, q_l) == 0) return 0;
+    }
+    return 1;
+}
+
+#ifdef HA_W1_CHECK
+static uint64_t ha_w1_n_check = 0, ha_w1_n_bad = 0;
+static void ha_w1_report(void) { fprintf(stderr, "[M::ha_w1_check] one-mismatch windows: %lu; different: %lu\n", (unsigned long)ha_w1_n_check, (unsigned long)ha_w1_n_bad); }
+static int ha_w1_report_set = atexit(ha_w1_report);
+#endif
+
+#define HC_NL 8 ///the most lanes of a batch: 8 with AVX-512 (ed_band_cal_semi_64_x8_avx512()), else 4
+#define HC_NB 32 ///the most windows of a batch: the exact and the scalar windows do not take a lane
+#define HC_NL_SCALAR 4 ///windows that ed_band_cal_semi_64_x4() aligns together
+
+///the result fields of ed_band_cal_semi_64_w_absent_diag()
+typedef struct {
+    int32_t thre, pl, tl, ps, pe, ts, te, err;
+} hc_wres_t;
+
+static inline void hc_wres_get(hc_wres_t *r, const bit_extz_t *e)
+{
+    r->thre = e->thre; r->pl = e->pl; r->tl = e->tl; r->ps = e->ps; r->pe = e->pe;
+    r->ts = e->ts; r->te = e->te; r->err = e->err;
+}
+
+static inline void hc_wres_set(bit_extz_t *e, const hc_wres_t *r)
+{
+    ///init_base_ed() names its parameter thre: (ez).thre in its body takes the argument text too
+    int32_t thre = r->thre, pn = r->pl, tn = r->tl;
+    init_base_ed(*e, thre, pn, tn);
+    e->ps = r->ps; e->pe = r->pe; e->ts = r->ts; e->te = r->te; e->err = r->err;
+}
+
+///ed_band_cal_semi_64_w_absent_diag() of n (<= HC_NL) windows at once, for abs_diag == 0 and
+///pn == tn + 2*thre (a full window); all windows have the same tn and thre. The windows are
+///independent, so their dependency chains interleave. The results are the same as with one call
+///per window.
+static void ed_band_cal_semi_64_x4(char **pstr, int32_t pn, char **tstr, int32_t tn, int32_t thre, int32_t n, hc_wres_t *res)
+{
+    Word Peq[HC_NL][5], VP[HC_NL], VN[HC_NL], X, D0, HN, HP, mm;
+    int32_t err[HC_NL], dead[HC_NL], bd, i, l, i_bd, tn0 = tn - 1, cut = thre + (thre<<1), n_dead = 0;
+    for (l = 0; l < n; l++) {
+        res[l].thre = thre; res[l].err = INT32_MAX; res[l].pl = pn; res[l].tl = tn;
+        res[l].ps = res[l].pe = -1; res[l].ts = 0; res[l].te = tn - 1;
+    }
+    if((pn > tn + cut) || (tn > pn + cut)) return;
+
+    bd = (thre<<1)+1; bd = ((bd<=pn)?bd:pn);
+    for (l = 0; l < n; l++) {
+        Peq[l][0] = Peq[l][1] = Peq[l][2] = Peq[l][3] = Peq[l][4] = 0;
+        for (i = 0, mm = 1; i < bd; i++) {
+            Peq[l][seq_nt4_table[(uint8_t)pstr[l][i]]] |= mm; mm <<= 1;
+        }
+        Peq[l][4] = 0; VP[l] = 0; VN[l] = 0; err[l] = 0; dead[l] = 0;
+    }
+    i_bd = (thre<<1); mm = ((Word)1 << (thre<<1));
+    for (i = 0; i < tn; i++) {
+        for (l = 0; l < n; l++) {
+            ed_core_64(Peq[l], VP[l], VN[l], X, D0, HN, HP, (uint8_t)tstr[l][i]);
+            if (!(D0&(1ULL))) {
+                ++err[l];
+                if ((err[l] > cut) && (!dead[l])) dead[l] = 1, ++n_dead;
+            }
+        }
+        if (n_dead == n) return;
+        if (i == tn0) break;
+        ++i_bd;
+        for (l = 0; l < n; l++) {
+            int32_t c = 4;
+            Peq[l][0] >>= 1; Peq[l][1] >>= 1; Peq[l][2] >>= 1; Peq[l][3] >>= 1;
+            if(i_bd < pn) c = seq_nt4_table[(uint8_t)pstr[l][i_bd]];
+            if(c < 4) Peq[l][c] |= mm;
+        }
     }
 
-    // if((!force_aln) && (!simi_pass(z->x_pos_e+1-z->x_pos_s, z->align_length, 0, ovlp_cut, &e_rate)) &&
-    //     (!simi_pass(z->x_pos_e+1-z->x_pos_s, z->align_length, sec_check, ovlp_cut, NULL))) return 0;
+    for (l = 0; l < n; l++) {
+        if (dead[l]) continue;
+        ///the end scan of ed_band_cal_semi_64_w_absent_diag() with abs_diag == 0 (site >= 0)
+        int32_t site = tn - 1, ai = pn - tn, uge = INT32_MAX, e = err[l], k;
+        if ((e <= thre) && (e <= res[l].err)) {
+            res[l].err = e; res[l].pe = site;
+        }
+        for (k = 0; k < ai; ) {
+            e += ((VP[l] >> k)&(1ULL)); e -= ((VN[l] >> k)&(1ULL)); ++k;
+            if ((e <= thre) && (e <= res[l].err)) {
+                res[l].err = e; res[l].pe = site + k;
+            }
+            if(k == thre) uge = e;
+        }
+        if((uge <= thre) && (uge == res[l].err)) res[l].pe = site + thre;
+    }
+}
+
+///the end scan of ed_band_cal_semi_64_w_absent_diag() with abs_diag == 0, for one window
+static inline void ed_semi_64_end_scan(Word VP, Word VN, int32_t err, int32_t pn, int32_t tn, int32_t thre, hc_wres_t *r)
+{
+    int32_t site = tn - 1, ai = pn - tn, uge = INT32_MAX, e = err, k;
+    if ((e <= thre) && (e <= r->err)) {
+        r->err = e; r->pe = site;
+    }
+    for (k = 0; k < ai; ) {
+        e += ((VP >> k)&(1ULL)); e -= ((VN >> k)&(1ULL)); ++k;
+        if ((e <= thre) && (e <= r->err)) {
+            r->err = e; r->pe = site + k;
+        }
+        if(k == thre) uge = e;
+    }
+    if((uge <= thre) && (uge == r->err)) r->pe = site + thre;
+}
+
+#if defined(__x86_64__) && !defined(HA_NO_AVX512)
+#define HC_HAVE_AVX512 1
+///the bases of n <= 8 strings to dst[i*8+l] = seq_nt4_table[s[l][i]] (lanes l >= n get 4), for
+///ed_band_cal_semi_64_x8_avx512(). 8 columns at a time: one vpermb transposes the 8x8 bytes and
+///vpermi2b looks up the first 128 entries of seq_nt4_table; the entries 128..255 are 4 (checked in
+///hc_use_vbmi()), so the bytes are the same as the table lookup.
+__attribute__((target("avx512f,avx512bw,avx512vbmi")))
+static void hc_transpose8_vbmi(char **s, int32_t n, int32_t len, uint8_t *dst)
+{
+    uint8_t tr_idx[64]; const char *p[8]; uint64_t w[8]; __mmask64 pad = 0; int32_t i, l, c;
+    for (c = 0; c < 8; c++)
+        for (l = 0; l < 8; l++) {
+            tr_idx[c*8+l] = l*8+c;
+            if (l >= n) pad |= (__mmask64)1 << (c*8+l);
+        }
+    for (l = 0; l < 8; l++) p[l] = s[l < n? l : 0];
+    const __m512i t0 = _mm512_loadu_si512((const void*)seq_nt4_table), t1 = _mm512_loadu_si512((const void*)(seq_nt4_table + 64));
+    const __m512i tr = _mm512_loadu_si512((const void*)tr_idx), four = _mm512_set1_epi8(4);
+    for (i = 0; i + 8 <= len; i += 8) {
+        __m512i x, y;
+        for (l = 0; l < 8; l++) memcpy(&w[l], p[l] + i, 8);
+        x = _mm512_permutexvar_epi8(tr, _mm512_loadu_si512((const void*)w));
+        y = _mm512_permutex2var_epi8(t0, x, t1);
+        y = _mm512_mask_mov_epi8(y, _mm512_movepi8_mask(x) | pad, four);
+        _mm512_storeu_si512((void*)(dst + (int64_t)i*8), y);
+    }
+    for (; i < len; i++) {
+        for (l = 0; l < n; l++) dst[i*8+l] = seq_nt4_table[(uint8_t)s[l][i]];
+        for (; l < 8; l++) dst[i*8+l] = 4;
+    }
+}
+
+static int hc_probe_vbmi(void)
+{
+    int k, r = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vbmi");
+    for (k = 128; k < 256; k++) if (seq_nt4_table[k] != 4) r = 0;
+    return r;
+}
+
+///the probe runs once: the initialization of a local static is thread-safe
+static int hc_use_vbmi(void)
+{
+    static const int r = hc_probe_vbmi();
+    return r;
+}
+
+#ifdef HA_TR8_CHECK
+uint64_t ha_tr8_n_check = 0, ha_tr8_n_bad = 0;
+static void ha_tr8_report(void) { fprintf(stderr, "[M::ha_tr8_check] transposed batches: %lu; different: %lu\n", (unsigned long)ha_tr8_n_check, (unsigned long)ha_tr8_n_bad); }
+static int ha_tr8_report_set = atexit(ha_tr8_report);
+#endif
+
+///ed_band_cal_semi_64_x4() for up to 8 windows, one per 64-bit lane of AVX-512. The bases of the
+///windows are transposed first (8 bytes per column), so one load gives the base of each lane. An
+///error count only grows, so a window is dead (err > cut) when its count at the end is above cut.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
+static void ed_band_cal_semi_64_x8_avx512(char **pstr, int32_t pn, char **tstr, int32_t tn, int32_t thre, int32_t n, hc_wres_t *res)
+{
+    static __thread uint8_t *qc = NULL, *tc = NULL; static __thread int64_t qc_m = 0, tc_m = 0;
+    Word P[4][8], vp[8], vn[8]; uint64_t ev[8];
+    int32_t bd, i, l, i_bd, cut = thre + (thre<<1);
+    for (l = 0; l < n; l++) {
+        res[l].thre = thre; res[l].err = INT32_MAX; res[l].pl = pn; res[l].tl = tn;
+        res[l].ps = res[l].pe = -1; res[l].ts = 0; res[l].te = tn - 1;
+    }
+    if((pn > tn + cut) || (tn > pn + cut)) return;
+    if (qc_m < (int64_t)tn * 8) { qc_m = (int64_t)tn * 8; qc = (uint8_t*)realloc(qc, qc_m); }
+    if (tc_m < (int64_t)pn * 8) { tc_m = (int64_t)pn * 8; tc = (uint8_t*)realloc(tc, tc_m); }
+    ///the bases per column; the lanes without a window get N (4): no match
+    if (hc_use_vbmi()) {
+        hc_transpose8_vbmi(tstr, n, tn, qc);
+        hc_transpose8_vbmi(pstr, n, pn, tc);
+    } else {
+        for (i = 0; i < tn; i++) {
+            for (l = 0; l < n; l++) qc[i*8+l] = seq_nt4_table[(uint8_t)tstr[l][i]];
+            for (; l < 8; l++) qc[i*8+l] = 4;
+        }
+        for (i = 0; i < pn; i++) {
+            for (l = 0; l < n; l++) tc[i*8+l] = seq_nt4_table[(uint8_t)pstr[l][i]];
+            for (; l < 8; l++) tc[i*8+l] = 4;
+        }
+    }
+#ifdef HA_TR8_CHECK
+    {
+        int64_t bad = 0;
+        for (i = 0; i < tn; i++) for (l = 0; l < 8; l++) bad |= (qc[i*8+l] != (l < n? seq_nt4_table[(uint8_t)tstr[l][i]] : 4));
+        for (i = 0; i < pn; i++) for (l = 0; l < 8; l++) bad |= (tc[i*8+l] != (l < n? seq_nt4_table[(uint8_t)pstr[l][i]] : 4));
+        __sync_fetch_and_add(&ha_tr8_n_check, 1); if (bad) __sync_fetch_and_add(&ha_tr8_n_bad, 1);
+    }
+#endif
+    bd = (thre<<1)+1; bd = ((bd<=pn)?bd:pn);
+    memset(P, 0, sizeof(P));
+    for (l = 0; l < 8; l++) {
+        Word mm = 1;
+        for (i = 0; i < bd; i++, mm <<= 1) {
+            uint8_t c = tc[i*8+l];
+            if (c < 4) P[c][l] |= mm;
+        }
+    }
+    __m512i P0 = _mm512_loadu_si512(P[0]), P1 = _mm512_loadu_si512(P[1]), P2 = _mm512_loadu_si512(P[2]), P3 = _mm512_loadu_si512(P[3]);
+    __m512i VP = _mm512_setzero_si512(), VN = _mm512_setzero_si512(), v_err = _mm512_setzero_si512();
+    const __m512i v_one = _mm512_set1_epi64(1), v_mm = _mm512_set1_epi64((long long)((Word)1 << (thre<<1)));
+    const __m512i v_c0 = _mm512_set1_epi64(0), v_c1 = _mm512_set1_epi64(1), v_c2 = _mm512_set1_epi64(2), v_c3 = _mm512_set1_epi64(3);
+    const __m512i v_cut = _mm512_set1_epi64(cut); const __mmask8 lanes = (__mmask8)(((1U)<<n)-1);
+    i_bd = (thre<<1);
+    for (i = 0; i < tn; i++) {
+        __m512i cv = _mm512_cvtepu8_epi64(_mm_loadl_epi64((const __m128i*)(qc + i*8)));
+        __m512i X = VN, D0, HN, HP;
+        X = _mm512_mask_or_epi64(X, _mm512_cmpeq_epi64_mask(cv, v_c0), X, P0);
+        X = _mm512_mask_or_epi64(X, _mm512_cmpeq_epi64_mask(cv, v_c1), X, P1);
+        X = _mm512_mask_or_epi64(X, _mm512_cmpeq_epi64_mask(cv, v_c2), X, P2);
+        X = _mm512_mask_or_epi64(X, _mm512_cmpeq_epi64_mask(cv, v_c3), X, P3);
+        ///ed_core_64()
+        D0 = _mm512_or_si512(_mm512_xor_si512(_mm512_add_epi64(VP, _mm512_and_si512(X, VP)), VP), X);
+        HN = _mm512_and_si512(VP, D0);
+        HP = _mm512_or_si512(VN, _mm512_ternarylogic_epi64(VP, D0, D0, 0x03));///~(VP|D0)
+        X = _mm512_srli_epi64(D0, 1);
+        VN = _mm512_and_si512(X, HP);
+        VP = _mm512_or_si512(HN, _mm512_ternarylogic_epi64(X, HP, HP, 0x03));///~(X|HP)
+        v_err = _mm512_add_epi64(v_err, _mm512_andnot_si512(D0, v_one));
+        if (i == tn - 1) break;
+        if (!(i&63) && (_mm512_cmpgt_epu64_mask(v_err, v_cut) & lanes) == lanes) return;///all dead (lanes >= n are not windows)
+        P0 = _mm512_srli_epi64(P0, 1); P1 = _mm512_srli_epi64(P1, 1); P2 = _mm512_srli_epi64(P2, 1); P3 = _mm512_srli_epi64(P3, 1);
+        ++i_bd;
+        if (i_bd < pn) {
+            __m512i tv = _mm512_cvtepu8_epi64(_mm_loadl_epi64((const __m128i*)(tc + i_bd*8)));
+            P0 = _mm512_mask_or_epi64(P0, _mm512_cmpeq_epi64_mask(tv, v_c0), P0, v_mm);
+            P1 = _mm512_mask_or_epi64(P1, _mm512_cmpeq_epi64_mask(tv, v_c1), P1, v_mm);
+            P2 = _mm512_mask_or_epi64(P2, _mm512_cmpeq_epi64_mask(tv, v_c2), P2, v_mm);
+            P3 = _mm512_mask_or_epi64(P3, _mm512_cmpeq_epi64_mask(tv, v_c3), P3, v_mm);
+        }
+    }
+    _mm512_storeu_si512(vp, VP); _mm512_storeu_si512(vn, VN); _mm512_storeu_si512(ev, v_err);
+    for (l = 0; l < n; l++) {
+        if ((int64_t)ev[l] > cut) continue;///dead: the scalar kernel returned early
+        ed_semi_64_end_scan(vp[l], vn[l], ev[l], pn, tn, thre, &res[l]);
+    }
+}
+
+static int hc_probe_avx512(void)
+{
+    return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512dq");
+}
+
+///the probe runs once: the initialization of a local static is thread-safe
+static int hc_use_avx512(void)
+{
+    static const int r = hc_probe_avx512();
+    return r;
+}
+#else
+static int hc_use_avx512(void) { return 0; }
+#endif
+
+uint32_t align_hc_ed_post_extz(overlap_region *z, All_reads *rref, char* qstr, char *tstr, bit_extz_t *exz, double e_rate, int64_t w_l, double ovlp_cut, int64_t force_aln, void *km)
+{
+    int64_t q_s, q_e, nw, k, j, nb, q_l, t_l, t_tot_l, aux_beg, aux_end, t_s, thre, aln_l, t_pri_l;
+    ///a batch of up to HC_NB windows (up to HC_NL of them in the lanes of the kernel): their coordinates,
+    ///the decoded targets, and the results
+    int64_t bq_s[HC_NB], bq_e[HC_NB], bt_s[HC_NB], bt_tot[HC_NB], baux_b[HC_NB], baux_e[HC_NB];
+    int32_t bmode[HC_NB]; ///0: no alignment (init_waln() failed); 1: aligned
+    hc_wres_t bres[HC_NB]; char *lp[HC_NL], *lt[HC_NL]; int32_t lid[HC_NL], nl, lq_l = -1, lthre = -1;
+    static __thread char *tb = NULL; static __thread int64_t tb_m = 0;
+    int64_t tb_l = w_l + (THRESHOLD_MAX_SIZE<<1) + 16;
+    char *q_string, *t_string;
+    z->w_list.n = 0; z->is_match = 0; z->align_length = 0;
+    if (tb_m < tb_l * HC_NB) {
+        tb_m = tb_l * HC_NB; tb = (char*)realloc(tb, tb_m);
+    }
+    nw = get_num_wins(z->x_pos_s, z->x_pos_e+1, w_l);
+    get_win_se_by_normalize_xs(z, (z->x_pos_s/w_l)*w_l, w_l, &q_s, &q_e);
+    int64_t nb_max = hc_use_avx512()? HC_NL : HC_NL_SCALAR;
+    for (k = 0; k < nw; ) {
+        ///1. the coordinates of the next windows and their targets, until the lanes are full; the exact
+        ///ones and the ones that do not fit ed_band_cal_semi_64_x4() get their result here. The results do
+        ///not depend on the batch: step 3 pushes them in order and stops at the first failed push.
+        for (nb = nl = 0; k < nw && nb < HC_NB && nl < nb_max; k++, nb++) {
+            aux_beg = aux_end = 0; q_l = 1 + q_e - q_s;
+            thre = q_l*e_rate; thre = Adjust_Threshold(thre, q_l);
+            if(thre > THRESHOLD_MAX_SIZE) thre = THRESHOLD_MAX_SIZE;
+            ///offset of y
+            t_s = (q_s - z->x_pos_s) + z->y_pos_s;
+            t_s += y_start_offset(q_s, &(z->f_cigar));
+
+            aln_l = q_l + (thre<<1); t_tot_l = Get_READ_LENGTH((*rref), z->y_id); 
+            bmode[nb] = 0;
+            if(init_waln(thre, t_s, t_tot_l, aln_l, &aux_beg, &aux_end, &t_s, &t_pri_l)) {
+                bmode[nb] = 1; bq_s[nb] = q_s; bq_e[nb] = q_e; bt_s[nb] = t_s; bt_tot[nb] = t_tot_l;
+                baux_b[nb] = aux_beg; baux_e[nb] = aux_end;
+                q_string = qstr+q_s; t_string = tb + nb*tb_l;
+                recover_UC_Read_sub_region(t_string, t_s, t_pri_l, z->y_pos_strand, rref, z->y_id);
+                t_l = t_pri_l;
+                if((aux_beg == 0) && (aux_end == 0) && (t_l == q_l + (thre<<1)) && is_exact_win(q_string, t_string + thre, q_l)) {
+                    set_exact_semi_win(exz, thre, t_l, q_l); hc_wres_get(&bres[nb], exz);
+                } else if((aux_beg == 0) && (t_l == q_l + (thre<<1)) && is_one_mismatch_win(q_string, t_string, q_l, thre)) {
+#ifdef HA_W1_CHECK
+                    hc_wres_t r1;
+                    set_exact_semi_win(exz, thre, t_l, q_l); exz->err = 1; hc_wres_get(&r1, exz);
+                    ed_band_cal_semi_64_w_absent_diag(t_string, t_l, q_string, q_l, thre, aux_beg, exz);
+                    hc_wres_get(&bres[nb], exz);
+                    __sync_fetch_and_add(&ha_w1_n_check, 1);
+                    if (memcmp(&r1, &bres[nb], sizeof(r1)) != 0) __sync_fetch_and_add(&ha_w1_n_bad, 1);
+#else
+                    set_exact_semi_win(exz, thre, t_l, q_l); exz->err = 1; hc_wres_get(&bres[nb], exz);
+#endif
+                } else if((aux_beg == 0) && (t_l == q_l + (thre<<1)) && (nl == 0 || (q_l == lq_l && thre == lthre))) {
+                    lp[nl] = t_string; lt[nl] = q_string; lid[nl] = nb; lq_l = q_l; lthre = thre; nl++;
+                } else {
+                    ed_band_cal_semi_64_w_absent_diag(t_string, t_l, q_string, q_l, thre, aux_beg, exz);
+                    hc_wres_get(&bres[nb], exz);
+                }
+            }
+            q_s = q_e + 1; q_e = q_s + w_l - 1; 
+            if(q_e >= (int64_t)z->x_pos_e) q_e = z->x_pos_e;
+        }
+        ///2. the windows that fit, together
+        if (nl == 1) {
+            ed_band_cal_semi_64_w_absent_diag(lp[0], lq_l + (lthre<<1), lt[0], lq_l, lthre, 0, exz);
+            hc_wres_get(&bres[lid[0]], exz);
+        } else if (nl > 1) {
+            hc_wres_t r[HC_NL];
+#ifdef HC_HAVE_AVX512
+            if (hc_use_avx512()) ed_band_cal_semi_64_x8_avx512(lp, lq_l + (lthre<<1), lt, lq_l, lthre, nl, r);
+            else ed_band_cal_semi_64_x4(lp, lq_l + (lthre<<1), lt, lq_l, lthre, nl, r);
+#else
+            ed_band_cal_semi_64_x4(lp, lq_l + (lthre<<1), lt, lq_l, lthre, nl, r);
+#endif
+            for (j = 0; j < nl; j++) bres[lid[j]] = r[j];
+        }
+        ///3. the results in the order of the windows, as one window at a time
+        for (j = 0; j < nb; j++) {
+            if (!bmode[j]) continue;
+            hc_wres_set(exz, &bres[j]);
+            if (is_align(*exz)) {
+                ///t_s do not have aux_beg, while t_s + t_end (aka, te) has 
+                if(!push_hc_wlst_exz(NULL, NULL, rref, z, qstr, tstr, exz, THRESHOLD_MAX_SIZE, bq_s[j], bq_e[j], bt_s[j], bt_s[j] + exz->pe, 
+                                        bt_tot[j], baux_b[j], baux_e[j], e_rate, w_l, ovlp_cut, force_aln, km)) {
+                    return 0;
+                }
+            } 
+        }
+    }
+
     if((!force_aln) && (!pass_qovlp(z->x_pos_e+1-z->x_pos_s, z->align_length, ovlp_cut))) return 0;
     return 1;
 }
