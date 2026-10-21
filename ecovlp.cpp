@@ -3987,6 +3987,7 @@ static void worker_hap_post_rev(void *data, long i, int tid)
 
     flip_paf_rc(i, &(R_INF.paf[i]), &R_INF);
     flip_paf_rc(i, &(R_INF.reverse_paf[i]), &R_INF);
+    ha_rd_mark(i);
 
     recover_UC_Read(&b->self_read, &R_INF, i); 
     l = b->self_read.length; kl = l>>1; a = b->self_read.seq;
@@ -6143,6 +6144,7 @@ static void worker_sl_ec(void *data, long i, int tid)
         // fprintf(stderr, "|%u%c(%c)", len, cm[c], ((c==1)||(c==2))?(cc[b]):('*')); // s_H
     }
     if(tot_e == 0) return;///no change
+    ha_rd_mark(i);
 
     yn = yk; yk++; kv_resize(char, (*p), yk); p->a[yn] = '\0';
     recover_UC_Read(&p->z, &R_INF, i); ///b->z.length

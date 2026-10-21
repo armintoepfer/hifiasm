@@ -879,6 +879,7 @@ static void worker_ec_save(void *data, long i, int tid)
 	}
 	R_INF.read_length[i] = new_read_length;
 	ha_compress_base(Get_READ(R_INF, i), new_read, new_read_length, &R_INF.N_site[i], N_occ);
+	ha_rd_mark(i);
 }
 
 void Output_corrected_reads()
@@ -1956,6 +1957,7 @@ void ha_ec_ff(int renew_idx)
     cal_ov_r(asm_opt.thread_num, R_INF.total_reads, renew_idx);
 
 	ha_pt_destroy(ha_idx); ha_idx = NULL;
+	ha_mzc_release();///the final overlaps were the last queries: the cache is not in the graph stage
 }
 
 static void worker_ov_utg(void *data, long i, int tid)

@@ -1116,8 +1116,21 @@ void *ha_flt_tab, ha_pt_t *ha_idx, All_reads* rdb, kvec_t_u64_warp* dbg_ct, st_m
 	}
 	clear_Candidates_list(cl); ab->mz.n = 0, ab->n_a = 0;
 	
-	// get the list of anchors
-	mz1_ha_sketch(rs, rl, mz_w, mz_k, 0, !(asm_opt.flag & HA_F_NO_HPC), &ab->mz, ha_flt_tab, asm_opt.mz_sample_dist, k_flag, dbg_ct, NULL, -1, asm_opt.dp_min_len, -1, sp, asm_opt.mz_rewin, 0, NULL);
+	// get the list of anchors; a read of the index of this round takes its minimizers from the index
+	// pass (ha_mzc_query), which sketched the same read with the same options
+	if (!(ha_mzc_qrid >= 0 && k_flag == NULL && dbg_ct == NULL && ha_mzc_query(ha_mzc_qrid, rl, rdb, &ab->mz))) {
+		mz1_ha_sketch(rs, rl, mz_w, mz_k, 0, !(asm_opt.flag & HA_F_NO_HPC), &ab->mz, ha_flt_tab, asm_opt.mz_sample_dist, k_flag, dbg_ct, NULL, -1, asm_opt.dp_min_len, -1, sp, asm_opt.mz_rewin, 0, NULL);
+	}
+#ifdef HA_MZC_CHECK
+	else {
+		ha_mz1_v t = {0, 0, 0}; uint32_t j; int bad = 0;
+		mz1_ha_sketch(rs, rl, mz_w, mz_k, 0, !(asm_opt.flag & HA_F_NO_HPC), &t, ha_flt_tab, asm_opt.mz_sample_dist, k_flag, dbg_ct, NULL, -1, asm_opt.dp_min_len, -1, sp, asm_opt.mz_rewin, 0, NULL);
+		if (t.n != ab->mz.n) bad = 1;
+		for (j = 0; !bad && j < t.n; j++) if (memcmp(&t.a[j], &ab->mz.a[j], sizeof(t.a[j]))) bad = 1;
+		__sync_fetch_and_add(&ha_mzc_n_check, 1); if (bad) __sync_fetch_and_add(&ha_mzc_n_bad, 1);
+		free(t.a);
+	}
+#endif
 
 	// minimizer of queried read
 	if (ab->mz.m > ab->old_mz_m) {
@@ -2485,7 +2498,9 @@ void h_ec_lchain(ha_abuf_t *ab, uint32_t rid, char* rs, uint64_t rl, uint64_t mz
 	int64_t max_skip, max_iter, max_dis, quick_check; double chn_pen_gap, chn_pen_skip;
 	set_lchain_dp_op(is_accurate, mz_k, &max_skip, &max_iter, &max_dis, &chn_pen_gap, &chn_pen_skip, &quick_check);
 	// minimizers_gen(ab, rs, rl, mz_w, mz_k, cl, k_flag, ha_flt_tab, ha_idx, dbg_ct, sp, high_occ, low_occ);
+	ha_mzc_qrid = (rref == &R_INF)? rid : -1;
 	minimizers_qgen0(ab, rs, rl, mz_w, mz_k, cl, k_flag, ha_flt_tab, ha_idx, rref, dbg_ct, sp, high_occ, low_occ);
+	ha_mzc_qrid = -1;
 	// lchain_gen(cl, overlap_list, rid, rl, NULL, uref, apend_be, f_cigar, max_n_chain, max_skip, max_iter, max_dis, chn_pen_gap, chn_pen_skip, bw_thres, quick_check, gen_off);
 	// lchain_qgen(cl, overlap_list, rid, rl, NULL, uref, apend_be, f_cigar, max_n_chain, max_skip, max_iter, max_dis, chn_pen_gap, chn_pen_skip, bw_thres, quick_check, gen_off);
 	///no need to sort here, overlap_list has been sorted at lchain_gen

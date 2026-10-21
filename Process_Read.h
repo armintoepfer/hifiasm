@@ -225,6 +225,7 @@ extern all_ul_t ULG_INF;
 
 void init_All_reads(All_reads* r);
 void malloc_All_reads(All_reads* r);
+void malloc_All_reads2(All_reads* r, int alloc_seq);
 void ha_insert_read_len(All_reads *r, int read_len, int name_len);
 void ha_compress_base(uint8_t* dest, char* src, uint64_t src_l, uint64_t** N_site_lis, uint64_t N_site_occ);
 void ha_compress_qual(uint8_t* dest, char* src, uint64_t src_l, uint64_t bitn, uint64_t sc_off);

@@ -81,6 +81,9 @@ void ha_ft_destroy(void *h);
 ha_pt_t *ha_pt_ul_gen(const hifiasm_opt_t *asm_opt, const void *flt_tab, ma_utg_v *us, int k, int w, int cutoff);
 ha_pt_t *ha_pt_ug_gen(const hifiasm_opt_t *asm_opt, const void *flt_tab, ma_utg_v *us, int is_HPC, int k, int w, int min_freq);
 ha_pt_t *ha_pt_gen(const hifiasm_opt_t *asm_opt, const void *flt_tab, int read_from_store, int is_hp_mode, All_reads *rs, int *hom_cov, int *het_cov);
+int ha_mzc_query(uint64_t rid, uint64_t rl, const All_reads *rs, ha_mz1_v *out);
+void ha_rd_mark(uint64_t rid);///read rid of R_INF changed (for the minimizer cache)
+void ha_mzc_release(void);///free the minimizer cache of the queries: no ha_pt_gen() of R_INF follows
 void ha_pt_destroy(ha_pt_t *h);
 const ha_idxpos_t *ha_pt_get(const ha_pt_t *h, uint64_t hash, int *n);
 const ha_idxposl_t *ha_ptl_get(const ha_pt_t *h, uint64_t hash, int *n);

@@ -431,6 +431,12 @@ void ha_insert_read_len(All_reads *r, int read_len, int name_len)
 
 void malloc_All_reads(All_reads* r)
 {
+	malloc_All_reads2(r, 1);
+}
+
+///alloc_seq 0: read_sperate[i] stays unset (the caller sets each one)
+void malloc_All_reads2(All_reads* r, int alloc_seq)
+{
 	r->read_size = (uint64_t*)malloc(sizeof(uint64_t)*r->total_reads);
 	memcpy(r->read_size, r->read_length, sizeof(uint64_t)*r->total_reads);
 
@@ -440,7 +446,7 @@ void malloc_All_reads(All_reads* r)
 	long long i = 0;
 	for (i = 0; i < (long long)r->total_reads; i++)
 	{
-		r->read_sperate[i] = (uint8_t*)malloc(sizeof(uint8_t)*(r->read_length[i]/4+1));
+		if (alloc_seq) r->read_sperate[i] = (uint8_t*)malloc(sizeof(uint8_t)*(r->read_length[i]/4+1));
 		if(r->rsc) MALLOC(r->rsc[i], (r->read_length[i]/sc_bn) + ((r->read_length[i]%sc_bn)?1:0));
 	}
 
