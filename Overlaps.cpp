@@ -366,6 +366,13 @@ void init_bub_label_t(bub_label_t* x, uint32_t n_thres, uint32_t n_reads)
     }
 }
 
+static void reset_bub_label_worker(void *data, long i, int tid)///callback for kt_for()
+{
+    bub_label_t* x = (bub_label_t*)data;
+    x->b[i].S.n = x->b[i].b.n = x->b[i].e.n = 0;
+    memset(x->b[i].a, 0, (x->n_reads<<1)*sizeof(binfo_s_t));
+}
+
 void reset_bub_label_t(bub_label_t* x, asg_t *g, uint64_t bub_dist, uint32_t check_cross)
 {
     uint32_t i;
@@ -381,11 +388,7 @@ void reset_bub_label_t(bub_label_t* x, asg_t *g, uint64_t bub_dist, uint32_t che
         }
     }
 
-    for (i = 0; i < x->n_thres; i++)
-    {
-        x->b[i].S.n = x->b[i].b.n = x->b[i].e.n = 0;
-        memset(x->b[i].a, 0, (x->n_reads<<1)*sizeof(binfo_s_t));
-    }
+    kt_for(asm_opt.thread_num, reset_bub_label_worker, x, x->n_thres);
 }
 
 void destory_bub_label_t(bub_label_t* x)
@@ -2182,11 +2185,35 @@ R_to_U* ruIndex, int max_hang, int min_ovlp)
 }
 
 
+///the arc test of each record for ma_hit_flt() in parallel: it reads the record and s, e of
+///coverage_cut, which the serial loop does not change (it changes only the del flags)
+typedef struct {
+    ma_hit_t_alloc* sources; ma_sub_t *coverage_cut; int max_hang, min_ovlp; uint64_t *off; uint8_t *ok;
+} ma_hit_flt_aux_t;
+
+static void ma_hit_flt_worker(void *data, long i, int tid)///callback for kt_for()
+{
+    ma_hit_flt_aux_t *a = (ma_hit_flt_aux_t*)data;
+    uint32_t j; asg_arc_t t; int r;
+    for (j = 0; j < a->sources[i].length; j++) {
+        ma_hit_t *h = &(a->sources[i].buffer[j]);
+        const ma_sub_t *sq = &(a->coverage_cut[Get_qn(*h)]);
+        const ma_sub_t *st = &(a->coverage_cut[Get_tn(*h)]);
+        r = ma_hit2arc(h, sq->e - sq->s, st->e - st->s, a->max_hang, asm_opt.max_hang_rate, a->min_ovlp, &t);
+        a->ok[a->off[i] + j] = (r >= 0 || r == MA_HT_QCONT || r == MA_HT_TCONT);
+    }
+}
+
 void ma_hit_flt(ma_hit_t_alloc* sources, long long n_read, ma_sub_t *coverage_cut, int max_hang, int min_ovlp)
 {
     double startTime = Get_T();
 	long long i, j, rLen;
-	asg_arc_t t;
+    ma_hit_flt_aux_t fa; uint64_t tot = 0;
+    fa.sources = sources; fa.coverage_cut = coverage_cut; fa.max_hang = max_hang; fa.min_ovlp = min_ovlp;
+    MALLOC(fa.off, n_read + 1);
+    for (i = 0; i < n_read; ++i) fa.off[i] = tot, tot += sources[i].length;
+    MALLOC(fa.ok, tot + 1);
+    kt_for(asm_opt.thread_num, ma_hit_flt_worker, &fa, n_read);
 
     for (i = 0; i < n_read; ++i) 
     {
@@ -2198,7 +2225,6 @@ void ma_hit_flt(ma_hit_t_alloc* sources, long long n_read, ma_sub_t *coverage_cu
             //check the corresponding two reads 
 		    const ma_sub_t *sq = &(coverage_cut[Get_qn(*h)]);
             const ma_sub_t *st = &(coverage_cut[Get_tn(*h)]);
-            int r;
 		    if (sq->del || st->del) continue;
             ///[sq->s, sq->e) and [st->s, st->e) are the high coverage region in query and target
             ///here just exculde the overhang?
@@ -2209,13 +2235,13 @@ void ma_hit_flt(ma_hit_t_alloc* sources, long long n_read, ma_sub_t *coverage_cu
             ///here the max_hang = 1000, asm_opt.max_hang_rate = 0.8, min_ovlp = 50
             ///for me, there should not have any overhang..so r cannot be equal to MA_HT_INT
             ///sq->e - sq->s = the length of query; st->e - st->s = the length od target
-            r = ma_hit2arc(h, sq->e - sq->s, st->e - st->s, max_hang, asm_opt.max_hang_rate, min_ovlp, &t);
+            ///(ma_hit2arc() in ma_hit_flt_worker())
 
 
             ///for me, there should not have any overhang..so r cannot be equal to MA_HT_INT
             ///and I think if we use same min_ovlp in all functions, r also cannot be MA_HT_SHORT_OVLP
             ///so it does not matter we have ma_hit2arc or not
-		    if (r >= 0 || r == MA_HT_QCONT || r == MA_HT_TCONT)
+		    if (fa.ok[fa.off[i] + j])
             {
                 h->del = 0;
                 rLen++;
@@ -2234,6 +2260,7 @@ void ma_hit_flt(ma_hit_t_alloc* sources, long long n_read, ma_sub_t *coverage_cu
             (coverage_cut)[i].del = 1;
         }
     }
+    free(fa.off); free(fa.ok);
 
     if(VERBOSE >= 1)
     {
@@ -2850,6 +2877,71 @@ ma_sub_t* coverage_cut, float shift_rate, all_ul_t *x, uint64_t ul_thres)
 }
 
 
+///the new coordinates of each record for ma_hit_cut() in parallel: they depend on the record and on
+///s, e of coverage_cut, which the serial loop does not change (it changes the del flags and, for each
+///record, only the record itself)
+typedef struct {
+    ma_hit_t_alloc* sources; ma_sub_t *coverage_cut; uint64_t *off; int32_t *c;
+} ma_hit_cut_aux_t;
+
+static void ma_hit_cut_worker(void *data, long i, int tid)///callback for kt_for()
+{
+    ma_hit_cut_aux_t *a = (ma_hit_cut_aux_t*)data;
+    uint32_t j; ma_hit_t* p; ma_sub_t* rq; ma_sub_t* rt; int32_t *o;
+    for (j = 0; j < a->sources[i].length; j++) {
+        p = &(a->sources[i].buffer[j]);
+        rq = &(a->coverage_cut[Get_qn(*p)]);
+        rt = &(a->coverage_cut[Get_tn(*p)]);
+        int qs, qe, ts, te;
+
+        ///target and query in different strand
+        if (p->rev) 
+        {
+            /**
+            here is an example in different strand:
+                                  
+                                   (te) (rt->e)           (rt->s)    (ts)
+                                    |      |                 |        |
+            target ----------------------------------------------------
+                                    ------------------------------------------- query
+                                    qs                                qe
+            **/
+            qs = p->te < rt->e? Get_qs(*p): Get_qs(*p) + (p->te - rt->e);
+            qe = p->ts > rt->s? p->qe : p->qe - (rt->s - p->ts);
+            ts = p->qe < rq->e? p->ts : p->ts + (p->qe - rq->e);
+            te = Get_qs(*p) > rq->s? p->te : p->te - (rq->s - Get_qs(*p));
+        }
+        else ///target and query in same strand
+        { 
+            /**
+            note: ts is the targe start in this overlap, 
+            while rt->s is the high coverage start in the whole target (not only in this overlap)
+            so this line is to normalize the qs in quey to high coverage region
+            **/
+            //(rt->s - p->ts) is the offset        
+            qs = p->ts > rt->s? Get_qs(*p): Get_qs(*p) + (rt->s - p->ts); 
+            //(p->te - rt->e) is the offset
+            qe = p->te < rt->e? p->qe : p->qe - (p->te - rt->e);
+            //(rq->s - Get_qs(*p) is the offset
+            ts = Get_qs(*p) > rq->s? p->ts : p->ts + (rq->s - Get_qs(*p));
+            //(p->qe - rq->e) is the offset
+            te = p->qe < rq->e? p->te : p->te - (p->qe - rq->e);
+		    }
+
+        
+
+        //cut by self coverage
+        //and normalize the qs, qe, ts, te by rq->s and rt->e
+        qs = ((uint32_t)qs > rq->s? qs : rq->s) - rq->s;
+        qe = ((uint32_t)qe < rq->e? qe : rq->e) - rq->s;
+        ts = ((uint32_t)ts > rt->s? ts : rt->s) - rt->s;
+        te = ((uint32_t)te < rt->e? te : rt->e) - rt->s;
+
+        o = a->c + ((a->off[i] + j)<<2);
+        o[0] = qs; o[1] = qe; o[2] = ts; o[3] = te;
+    }
+}
+
 void ma_hit_cut(ma_hit_t_alloc* sources, long long n_read, uint64_t* readLen, 
 long long mini_overlap_length, ma_sub_t** coverage_cut)
 {
@@ -2859,6 +2951,12 @@ long long mini_overlap_length, ma_sub_t** coverage_cut)
     ma_sub_t* rq;
     ma_sub_t* rt;
     long long rLen = 0;
+    ma_hit_cut_aux_t ca; uint64_t tot = 0;
+    ca.sources = sources; ca.coverage_cut = *coverage_cut;
+    MALLOC(ca.off, n_read + 1);
+    for (i = 0; i < (uint64_t)n_read; ++i) ca.off[i] = tot, tot += sources[i].length;
+    MALLOC(ca.c, (tot<<2) + 4);
+    kt_for(asm_opt.thread_num, ma_hit_cut_worker, &ca, n_read);
     for (i = 0; i < (uint64_t)n_read; ++i) 
     {
         rLen = 0;
@@ -2873,52 +2971,10 @@ long long mini_overlap_length, ma_sub_t** coverage_cut)
             ///if any of target read and the query read has no enough coverage
 		    if (rq->del || rt->del) continue;
             int qs, qe, ts, te;
-
-
-
-
-            ///target and query in different strand
-            if (p->rev) 
-            {
-                /**
-                here is an example in different strand:
-                                      
-                                       (te) (rt->e)           (rt->s)    (ts)
-                                        |      |                 |        |
-                target ----------------------------------------------------
-                                        ------------------------------------------- query
-                                        qs                                qe
-                **/
-                qs = p->te < rt->e? Get_qs(*p): Get_qs(*p) + (p->te - rt->e);
-                qe = p->ts > rt->s? p->qe : p->qe - (rt->s - p->ts);
-                ts = p->qe < rq->e? p->ts : p->ts + (p->qe - rq->e);
-                te = Get_qs(*p) > rq->s? p->te : p->te - (rq->s - Get_qs(*p));
+            {///(the coordinates of ma_hit_cut_worker())
+                const int32_t *o = ca.c + ((ca.off[i] + j)<<2);
+                qs = o[0]; qe = o[1]; ts = o[2]; te = o[3];
             }
-            else ///target and query in same strand
-            { 
-                /**
-                note: ts is the targe start in this overlap, 
-                while rt->s is the high coverage start in the whole target (not only in this overlap)
-                so this line is to normalize the qs in quey to high coverage region
-                **/
-                //(rt->s - p->ts) is the offset        
-                qs = p->ts > rt->s? Get_qs(*p): Get_qs(*p) + (rt->s - p->ts); 
-                //(p->te - rt->e) is the offset
-                qe = p->te < rt->e? p->qe : p->qe - (p->te - rt->e);
-                //(rq->s - Get_qs(*p) is the offset
-                ts = Get_qs(*p) > rq->s? p->ts : p->ts + (rq->s - Get_qs(*p));
-                //(p->qe - rq->e) is the offset
-                te = p->qe < rq->e? p->te : p->te - (p->qe - rq->e);
-		    }
-
-            
-
-            //cut by self coverage
-            //and normalize the qs, qe, ts, te by rq->s and rt->e
-            qs = ((uint32_t)qs > rq->s? qs : rq->s) - rq->s;
-            qe = ((uint32_t)qe < rq->e? qe : rq->e) - rq->s;
-            ts = ((uint32_t)ts > rt->s? ts : rt->s) - rt->s;
-            te = ((uint32_t)te < rt->e? te : rt->e) - rt->s;
 
             if (qe - qs >= mini_overlap_length && te - ts >= mini_overlap_length) 
             {
@@ -2946,6 +3002,7 @@ long long mini_overlap_length, ma_sub_t** coverage_cut)
             (*coverage_cut)[i].del = 1;
         }
     }
+    free(ca.off); free(ca.c);
 
     if(VERBOSE >= 1)
     {
@@ -5973,7 +6030,7 @@ int asg_arc_del_short(asg_t *g, float drop_ratio)
 
 
 inline int check_weak_ma_hit(ma_hit_t_alloc* aim_paf, ma_hit_t_alloc* reverse_paf_list, 
-long long weakID, uint32_t w_qs, uint32_t w_qe)
+long long weakID, uint32_t w_qs, uint32_t w_qe, const ovlp_tn_t *rix)///rix: the compact tn copy of reverse_paf_list
 {
     long long i = 0;
     long long strongID, index;
@@ -5990,7 +6047,7 @@ long long weakID, uint32_t w_qs, uint32_t w_qe)
         Get_qe(aim_paf->buffer[i]) >= w_qe)
         {
             strongID = Get_tn(aim_paf->buffer[i]);
-            index = get_specific_overlap(&(reverse_paf_list[strongID]), strongID, weakID);
+            index = ovlp_tn_get(rix, &(reverse_paf_list[strongID]), strongID, strongID, weakID);
             if(index != -1) {
                 // if((Get_qn(aim_paf->buffer[i]) == 27087 && weakID == 27128) || (Get_qn(aim_paf->buffer[i]) == 27128 && weakID == 27087)) {
                 //     ma_hit_t *h = &(aim_paf->buffer[i]);
@@ -11501,42 +11558,62 @@ static void update_weak_by_contain(void *data, long i, int tid)
     }
 }
 
-void clean_weak_ma_hit_t(ma_hit_t_alloc* sources, ma_hit_t_alloc* reverse_sources, long long num_sources, uint32_t ou_thres)
+typedef struct {
+    ma_hit_t_alloc *src, *rev; ovlp_tn_t *ix, *rix; uint32_t ou_thres;
+    kvec_t(uint64_t) *fl;///per thread: (list, index) pairs of the records to flag
+} clean_weak_aux_t;
+
+///the checks of clean_weak_ma_hit_t() for the list i: they read only del, ml, the positions and the
+///low bits of bl, and the loop writes only the flag 0x40000000 of bl; the flags are set afterwards
+static void clean_weak_worker(void *data, long i, int tid)///callback for kt_for()
 {
-    double startTime = Get_T();
-    long long i, j, index;
+    clean_weak_aux_t *s = (clean_weak_aux_t*)data; ma_hit_t_alloc *sources = s->src;
+    long long j, index;
     uint32_t qn, tn, ou;
+    for (j = 0; j < sources[i].length; j++) {
+        qn = Get_qn(sources[i].buffer[j]);
+        tn = Get_tn(sources[i].buffer[j]);
 
-    for (i = 0; i < num_sources; i++) {
-        for (j = 0; j < sources[i].length; j++) {
-            qn = Get_qn(sources[i].buffer[j]);
-            tn = Get_tn(sources[i].buffer[j]);
-
-            if(sources[i].buffer[j].del) continue;
-            ou = (sources[i].buffer[j].bl&((uint32_t)0x3fffffff));
-            //if this is a weak overlap; ml == 0 -> weak overlap
-            if((sources[i].buffer[j].ml == 0) && ((ou_thres==((uint32_t)-1)) || (ou < ou_thres)))
-            {   
-                if(
-                !check_weak_ma_hit(&(sources[qn]), reverse_sources, tn, 
-                Get_qs(sources[i].buffer[j]), Get_qe(sources[i].buffer[j]))
-                /**
-                ||
-                !check_weak_ma_hit_reverse(&(reverse_sources[qn]), sources, tn)**/)
-                {
-                    sources[i].buffer[j].bl |= ((uint32_t)0x40000000);
-                    index = get_specific_overlap(&(sources[tn]), tn, qn);
-                    // if(index < 0 || index >= sources[tn].length) fprintf(stderr, "sb, tn: %u, qn: %u, index: %ld, length: %u\n", tn, qn, index, sources[tn].length);
-                    sources[tn].buffer[index].bl |= ((uint32_t)0x40000000);
-                    // ma_hit_t *h = &(sources[i].buffer[j]);
-                    // if((Get_qn(*h) == 27087 && Get_tn(*h) == 27128) || (Get_tn(*h) == 27087 && Get_qn(*h) == 27128)) {
-                    //     fprintf(stderr, "[M::%s]\t%.*s(qn::%u)\t%u\t%u\t%u\t%c\t%.*s(tn::%u)\t%u\t%u\t%u\t%u\t%u\t255\n", __func__, (int)Get_NAME_LENGTH(R_INF, Get_qn(*h)), Get_NAME((R_INF), Get_qn(*h)), Get_qn(*h), (uint32_t)Get_READ_LENGTH(R_INF, Get_qn(*h)), Get_qs(*h), Get_qe(*h), "+-"[h->rev], 
-                    //         (int)Get_NAME_LENGTH(R_INF, Get_tn(*h)), Get_NAME((R_INF), Get_tn(*h)), Get_tn(*h), (uint32_t)Get_READ_LENGTH(R_INF, Get_tn(*h)), Get_ts(*h), Get_te(*h), h->ml, h->bl);
-                    // }
-                }
+        if(sources[i].buffer[j].del) continue;
+        ou = (sources[i].buffer[j].bl&((uint32_t)0x3fffffff));
+        //if this is a weak overlap; ml == 0 -> weak overlap
+        if((sources[i].buffer[j].ml == 0) && ((s->ou_thres==((uint32_t)-1)) || (ou < s->ou_thres)))
+        {   
+            if(
+            !check_weak_ma_hit(&(sources[qn]), s->rev, tn, 
+            Get_qs(sources[i].buffer[j]), Get_qe(sources[i].buffer[j]), s->rix)
+            /**
+            ||
+            !check_weak_ma_hit_reverse(&(reverse_sources[qn]), sources, tn)**/)
+            {
+                index = ovlp_tn_get(s->ix, &(sources[tn]), tn, tn, qn);
+                kv_push(uint64_t, s->fl[tid], (uint64_t)i); kv_push(uint64_t, s->fl[tid], (uint64_t)j);
+                kv_push(uint64_t, s->fl[tid], (uint64_t)tn); kv_push(uint64_t, s->fl[tid], (uint64_t)index);
             }
         }
     }
+}
+
+void clean_weak_ma_hit_t(ma_hit_t_alloc* sources, ma_hit_t_alloc* reverse_sources, long long num_sources, uint32_t ou_thres)
+{
+    double startTime = Get_T();
+    long long k, z;
+    ovlp_tn_t ix, rix;///the loop below changes only the flags in bl: the lists keep their records
+    ovlp_tn_build(&ix, sources, num_sources); ovlp_tn_build(&rix, reverse_sources, num_sources);
+
+    clean_weak_aux_t cw; cw.src = sources; cw.rev = reverse_sources; cw.ix = &ix; cw.rix = &rix; cw.ou_thres = ou_thres;
+    CALLOC(cw.fl, asm_opt.thread_num);
+    kt_for(asm_opt.thread_num, clean_weak_worker, &cw, num_sources);
+    for (k = 0; k < asm_opt.thread_num; k++) {
+        for (z = 0; z + 4 <= (long long)cw.fl[k].n; z += 4) {
+            sources[cw.fl[k].a[z]].buffer[(long long)cw.fl[k].a[z+1]].bl |= ((uint32_t)0x40000000);
+            sources[cw.fl[k].a[z+2]].buffer[(long long)cw.fl[k].a[z+3]].bl |= ((uint32_t)0x40000000);
+        }
+        kv_destroy(cw.fl[k]);
+    }
+    free(cw.fl);
+
+    ovlp_tn_destroy(&ix); ovlp_tn_destroy(&rix);
 
     sset_aux s; s.src = sources; s.ul_occ = 0;
     kt_for(asm_opt.thread_num, update_weak_by_contain, &s, num_sources);
@@ -14340,10 +14417,24 @@ uint8_t* is_r_het, long long het_cov_thres)
 }
 
 
+///set_ug_coverage_aggressive() of the unitigs in parallel: a unitig writes only the C_HET flags of its
+///own reads (an OR), and r_flag is scratch that it clears again (one for each thread)
+typedef struct {
+    ma_ug_t *ug; asg_t *sg; ma_sub_t* coverage_cut; ma_hit_t_alloc* sources; R_to_U* ruIndex; uint8_t* is_r_het;
+    uint64_t dip_thres; uint8_t **flag;
+} r_het_aux_t;
+
+static void set_r_het_worker(void *data, long m, int tid)///callback for kt_for()
+{
+    r_het_aux_t *a = (r_het_aux_t*)data;
+    if (a->flag[tid] == NULL) a->flag[tid] = (uint8_t*)calloc(a->sg->n_seq, sizeof(uint8_t));
+    set_ug_coverage_aggressive(a->ug, m, a->sg, a->coverage_cut, a->sources, a->ruIndex, a->flag[tid], a->is_r_het, a->dip_thres);
+}
+
 void set_r_het_flag(ma_ug_t *ug, asg_t *sg, ma_sub_t* coverage_cut, ma_hit_t_alloc* sources, R_to_U* ruIndex, uint8_t* is_r_het)
 {
-    uint64_t m, dip_thre_max, dip_thres;
-    uint8_t* primary_flag = (uint8_t*)calloc(sg->n_seq, sizeof(uint8_t));
+    uint64_t m, dip_thre_max;
+    int n_thread = asm_opt.thread_num > 0? asm_opt.thread_num : 1;
 
     if(asm_opt.hom_global_coverage_set)
     {
@@ -14358,13 +14449,12 @@ void set_r_het_flag(ma_ug_t *ug, asg_t *sg, ma_sub_t* coverage_cut, ma_hit_t_all
 
     // fprintf(stderr, "dip_thre_max: %lu\n", dip_thre_max);
             
-    for (m = 0; m < ug->g->n_seq; m++)
-    {
-        dip_thres = dip_thre_max;
-        ///if(ug->u.a[m].n <= dip_thre_max) dip_thres = dip_thre_max * 1.1;
-        set_ug_coverage_aggressive(ug, m, sg, coverage_cut, sources, ruIndex, primary_flag, is_r_het, dip_thres);
-    }
-    free(primary_flag); 
+    ///if(ug->u.a[m].n <= dip_thre_max) dip_thres = dip_thre_max * 1.1;
+    r_het_aux_t a; a.ug = ug; a.sg = sg; a.coverage_cut = coverage_cut; a.sources = sources; a.ruIndex = ruIndex;
+    a.is_r_het = is_r_het; a.dip_thres = dip_thre_max; a.flag = (uint8_t**)calloc(n_thread, sizeof(uint8_t*));
+    kt_for(n_thread, set_r_het_worker, &a, ug->g->n_seq);
+    for (m = 0; m < (uint64_t)n_thread; m++) free(a.flag[m]);
+    free(a.flag);
 }
 
 
@@ -32367,33 +32457,26 @@ char* output_file_name, ma_hit_t_alloc** reverse_sources, R_to_U* ruIndex, all_u
 }
 
 
-hap_cov_t* init_hap_cov_t(ma_ug_t *ug, asg_t* read_g, ma_hit_t_alloc* sources, R_to_U* ruIndex, 
-ma_hit_t_alloc* reverse_sources, ma_sub_t *coverage_cut, int max_hang, int min_ovlp, 
-uint32_t is_collect_trans)
+///the coverage of the reads of one unitig for init_hap_cov_t(): a unitig writes only cov[] of its own
+///reads (a MAX), and set[] is scratch that it clears again (one for each thread)
+typedef struct {
+    ma_ug_t *ug; asg_t* read_g; ma_hit_t_alloc* sources; R_to_U* ruIndex; hap_cov_t *x; uint8_t **set;
+} hap_cov_aux_t;
+
+static void init_hap_cov_worker(void *data, long i0, int tid)///callback for kt_for()
 {
-    uint32_t n_ux = ug->g->n_seq, i, k, j, v, rId, tn, is_Unitig, r_i, nv, w, C_bases;
-    uint8_t *set = NULL; 
-    hap_cov_t *x = NULL; CALLOC(x, 1);
-    x->n = read_g->n_seq; 
-    x->reverse_sources = reverse_sources;
-    x->coverage_cut = coverage_cut;
-    x->ruIndex = ruIndex;
-    x->max_hang = max_hang;
-    x->min_ovlp = min_ovlp;
-    x->read_g = read_g;
-    x->t_ch = NULL;
-    kv_init(x->u_buffer.a);
-    kv_init(x->tailIndex.a);
-    kv_init(x->prevIndex.a);
+    hap_cov_aux_t *aux = (hap_cov_aux_t*)data;
+    ma_ug_t *ug = aux->ug; asg_t* read_g = aux->read_g; ma_hit_t_alloc* sources = aux->sources;
+    R_to_U* ruIndex = aux->ruIndex; hap_cov_t *x = aux->x;
+    uint32_t i = i0, k, j, v, rId, tn, is_Unitig, r_i, nv, w, C_bases;
     ma_utg_t* u = NULL;
     asg_arc_t *av = NULL;
     ma_hit_t *h = NULL;
-    MALLOC(x->pos_idx, x->n); memset(x->pos_idx, -1, x->n*sizeof(uint64_t));
-    CALLOC(set, read_g->n_seq<<1);
-    CALLOC(x->cov, x->n); 
-    for (i = 0; i < n_ux; i++)//get the coverage for each read
-    {    
-        if(ug->g->seq[i].del) continue;
+    uint8_t *set;
+    if (aux->set[tid] == NULL) aux->set[tid] = (uint8_t*)calloc(read_g->n_seq<<1, sizeof(uint8_t));
+    set = aux->set[tid];
+    {
+        if(ug->g->seq[i].del) return;
         u = &(ug->u.a[i]);
         for (r_i = 0; r_i < u->n; r_i++) set[u->a[r_i]>>33] = 1;
 
@@ -32478,8 +32561,36 @@ uint32_t is_collect_trans)
             for (r_i = 0; r_i < u->n; r_i++) set[u->a[r_i]>>33] = 0;
         }
     }
+}
 
-    if(set) free(set);
+hap_cov_t* init_hap_cov_t(ma_ug_t *ug, asg_t* read_g, ma_hit_t_alloc* sources, R_to_U* ruIndex, 
+ma_hit_t_alloc* reverse_sources, ma_sub_t *coverage_cut, int max_hang, int min_ovlp, 
+uint32_t is_collect_trans)
+{
+    uint32_t n_ux = ug->g->n_seq, i;
+    hap_cov_t *x = NULL; CALLOC(x, 1);
+    x->n = read_g->n_seq; 
+    x->reverse_sources = reverse_sources;
+    x->coverage_cut = coverage_cut;
+    x->ruIndex = ruIndex;
+    x->max_hang = max_hang;
+    x->min_ovlp = min_ovlp;
+    x->read_g = read_g;
+    x->t_ch = NULL;
+    kv_init(x->u_buffer.a);
+    kv_init(x->tailIndex.a);
+    kv_init(x->prevIndex.a);
+    MALLOC(x->pos_idx, x->n); memset(x->pos_idx, -1, x->n*sizeof(uint64_t));
+    CALLOC(x->cov, x->n); 
+    {//get the coverage for each read
+        int n_thread = asm_opt.thread_num > 0? asm_opt.thread_num : 1;
+        hap_cov_aux_t aux; aux.ug = ug; aux.read_g = read_g; aux.sources = sources; aux.ruIndex = ruIndex; aux.x = x;
+        aux.set = (uint8_t**)calloc(n_thread, sizeof(uint8_t*));
+        kt_for(n_thread, init_hap_cov_worker, &aux, n_ux);
+        for (i = 0; i < (uint32_t)n_thread; i++) free(aux.set[i]);
+        free(aux.set);
+    }
+
     CALLOC(x->is_r_het, read_g->n_seq);
     set_r_het_flag(ug, read_g, coverage_cut, sources, ruIndex, x->is_r_het);
 
@@ -33465,6 +33576,18 @@ void asg_delete_node_by_trio(asg_t* sg, uint8_t flag)
 
 
 
+typedef struct {
+    ma_hit_t_alloc *src, *rev;
+} renew_del_aux_t;
+
+static void renew_del_worker(void *data, long i, int tid)///callback for kt_for()
+{
+    renew_del_aux_t *a = (renew_del_aux_t*)data;
+    uint64_t j;
+    for (j = 0; j < a->src[i].length; j++) a->src[i].buffer[j].del = 0;
+    for (j = 0; j < a->rev[i].length; j++) a->rev[i].buffer[j].del = 0;
+}
+
 void renew_graph_init(ma_hit_t_alloc* sources, ma_hit_t_alloc* reverse_sources, asg_t *sg, ma_sub_t *coverage_cut, R_to_U* ruIndex, uint64_t n_read)
 {
     if(sg != NULL) asg_destroy(sg);
@@ -33475,17 +33598,9 @@ void renew_graph_init(ma_hit_t_alloc* sources, ma_hit_t_alloc* reverse_sources, 
 
     memset(ruIndex->index, -1, sizeof(uint32_t)*(ruIndex->len));
 
-
-    uint64_t i = 0, j = 0;
-    for (i = 0; i < n_read; i++) {
-        for (j = 0; j < sources[i].length; j++) {
-            sources[i].buffer[j].del = 0;
-        }
-
-        for (j = 0; j < reverse_sources[i].length; j++) {
-            reverse_sources[i].buffer[j].del = 0;
-        }
-    }
+    ///the reads are independent: clear the del flags in parallel
+    renew_del_aux_t a; a.src = sources; a.rev = reverse_sources;
+    kt_for(asm_opt.thread_num, renew_del_worker, &a, n_read);
 }
 
 
