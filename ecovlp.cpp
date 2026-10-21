@@ -6127,6 +6127,28 @@ void dbg_rsc(char *str0, uint64_t l0, char *str1, uint64_t l1, asg16_v *sc, char
 
 }
 
+#ifdef HA_RND_STAT
+/* the check build HA_RND_STAT: for each round, the reads that change, and the clean reads (the read
+ * and all targets of its overlaps unchanged in the round); in the next round, the clean reads that
+ * change */
+static uint8_t *ha_rs_chg, *ha_rs_cln; static uint64_t ha_rs_n;
+static void ha_rs_round(uint64_t n_a, uint64_t round)
+{
+    uint64_t i, j, n_chg = 0, n_cln = 0, b_cln = 0, b_all = 0, n_cln_chg = 0, n_prev = 0;
+    for (i = 0; i < n_a; i++) {
+        uint32_t l = Get_READ_LENGTH(R_INF, i); int ok = !ha_rs_chg[i];
+        b_all += l; n_chg += ha_rs_chg[i];
+        if (ha_rs_cln[i]) { n_prev++; n_cln_chg += ha_rs_chg[i]; }
+        for (j = 0; ok && j < R_INF.paf[i].length; j++)
+            if (ha_rs_chg[Get_tn(R_INF.paf[i].buffer[j])]) ok = 0;
+        ha_rs_cln[i] = ok; n_cln += ok; if (ok) b_cln += l;
+    }
+    fprintf(stderr, "[M::ha_rnd_stat] round %lu: reads %lu, changed %lu, clean %lu (bases %.4f); clean after the last round: %lu, of them changed now: %lu\n",
+            (unsigned long)round, (unsigned long)n_a, (unsigned long)n_chg, (unsigned long)n_cln, b_all? (double)b_cln / b_all : 0.0, (unsigned long)n_prev, (unsigned long)n_cln_chg);
+    memset(ha_rs_chg, 0, n_a);
+}
+#endif
+
 static void worker_sl_ec(void *data, long i, int tid)
 {
     // if(i != 0) return;
@@ -6145,6 +6167,9 @@ static void worker_sl_ec(void *data, long i, int tid)
     }
     if(tot_e == 0) return;///no change
     ha_rd_mark(i);
+#ifdef HA_RND_STAT
+    ha_rs_chg[i] = 1;
+#endif
 
     yn = yk; yk++; kv_resize(char, (*p), yk); p->a[yn] = '\0';
     recover_UC_Read(&p->z, &R_INF, i); ///b->z.length
@@ -6442,8 +6467,14 @@ void cal_ec_r(uint64_t n_thre, uint64_t round, uint64_t n_round, uint64_t n_a, u
 
 
     b = gen_ec_ovec_buf_t(n_thre);
+#ifdef HA_RND_STAT
+    if (ha_rs_n != n_a) { free(ha_rs_chg); free(ha_rs_cln); CALLOC(ha_rs_chg, n_a); CALLOC(ha_rs_cln, n_a); ha_rs_n = n_a; }
+#endif
     (*tot_e) += cal_ec_multiple(b, n_thre, n_a, tot_b); ///exit(1);
     sl_ec_r(n_thre, n_a);
+#ifdef HA_RND_STAT
+    ha_rs_round(n_a, round);
+#endif
 
     for (k = 0; k < n_round; k++) {
         (*tot_e) += cal_sec_ec_multiple(b, n_thre, n_a, k);
