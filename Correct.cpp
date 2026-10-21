@@ -16029,11 +16029,93 @@ All_reads *rref, int64_t id)
     }
 }
 
+///the result of ed_band_cal_global_64_w_trace() for two equal strings without N: the only path with
+///no error is the diagonal (every other path has at least 2 indels)
+static inline void set_exact_global_64(bit_extz_t *ez, int32_t thre, int32_t pn, int32_t tn)
+{
+    ez->cigar.n = 0; ez->nword = 1;
+    init_base_ed(*ez, thre, pn, tn); ez->ps = ez->ts = 0;
+    ez->path.n = (ez->nword*tn*HA_TRACE_WORDS);
+    kv_resize(w_sig, ez->path, ez->path.n);
+    ez->err = 0; ez->pe = pn-1; ez->te = tn-1;
+    push_trace(&(ez->cigar), 0, tn);
+}
+
+///the position of the only mismatch of p and t (l bases), if they differ at exactly one position and
+///have no N; else -1
+static inline int32_t hc_one_mismatch(const char *p, const char *t, int32_t l)
+{
+    int32_t k, pos = -1;
+    for (k = 0; k < l; k++) {
+        if (p[k] == 'N' || t[k] == 'N') return -1;
+        if (p[k] != t[k]) {
+            if (pos >= 0) return -1;
+            pos = k;
+        }
+    }
+    return pos;
+}
+
+///the result of ed_band_cal_global_64_w_trace() for two strings of tn bases with one mismatch at k and
+///no N (thre >= 1): err 1 on the diagonal; the CIGAR is k matches, 1 mismatch, tn-k-1 matches
+static inline void set_one_mismatch_global_64(bit_extz_t *ez, int32_t thre, int32_t pn, int32_t tn, int32_t k)
+{
+    ez->cigar.n = 0; ez->nword = 1;
+    init_base_ed(*ez, thre, pn, tn); ez->ps = ez->ts = 0;
+    ez->path.n = (ez->nword*tn*HA_TRACE_WORDS);
+    kv_resize(w_sig, ez->path, ez->path.n);
+    ez->err = 1; ez->pe = pn-1; ez->te = tn-1;
+    if (k > 0) push_trace(&(ez->cigar), 0, k);
+    push_trace(&(ez->cigar), 1, 1);
+    if (tn - k - 1 > 0) push_trace(&(ez->cigar), 0, tn - k - 1);
+}
+
+#ifdef HA_GLB_CHECK
+uint64_t ha_glb_n_check = 0, ha_glb_n_bad = 0;
+static void ha_glb_report(void) { fprintf(stderr, "[M::ha_glb_check] exact global alignments: %lu; different: %lu\n", (unsigned long)ha_glb_n_check, (unsigned long)ha_glb_n_bad); }
+static int ha_glb_report_set = atexit(ha_glb_report);
+#endif
+
 void cal_exz_global(char *pstr, int32_t pn, char *tstr, int32_t tn, int32_t thre, bit_extz_t *ez)
 {
     int32_t bd, nword;
     bd = (((thre)<<1)+1); nword = ((bd>>bitw)+(!!(bd&bitz)));
 
+    if(nword <= 1 && pn == tn && ez->err > thre && is_exact_win(tstr, pstr, tn)) {
+#ifdef HA_GLB_CHECK
+        bit_extz_t e; size_t k; int bad;
+        memset(&e, 0, sizeof(e)); e.err = ez->err;
+        ed_band_cal_global_64_w_trace(pstr, pn, tstr, tn, thre, &e);
+        set_exact_global_64(ez, thre, pn, tn);
+        bad = (e.err != ez->err || e.ps != ez->ps || e.pe != ez->pe || e.ts != ez->ts || e.te != ez->te || e.pl != ez->pl || e.tl != ez->tl || e.thre != ez->thre || e.nword != ez->nword || e.path.n != ez->path.n || e.cigar.n != ez->cigar.n
+            || e.done_cigar != ez->done_cigar || e.cigar_n != ez->cigar_n || e.done_path != ez->done_path || e.path_n != ez->path_n);
+        for (k = 0; !bad && k < e.cigar.n; k++) bad = (e.cigar.a[k] != ez->cigar.a[k]);
+        __sync_fetch_and_add(&ha_glb_n_check, 1); if (bad) __sync_fetch_and_add(&ha_glb_n_bad, 1);
+        free(e.cigar.a); free(e.path.a);
+#else
+        set_exact_global_64(ez, thre, pn, tn);
+#endif
+        return;
+    }
+    if(nword <= 1 && pn == tn && ez->err > thre && thre >= 1 && tn < 0x3fff) {///one mismatch, no N: the only path with 1 error is the diagonal
+        int32_t k = hc_one_mismatch(pstr, tstr, tn);
+        if (k >= 0) {
+#ifdef HA_GLB_CHECK
+            bit_extz_t e; size_t z; int bad;
+            memset(&e, 0, sizeof(e)); e.err = ez->err;
+            ed_band_cal_global_64_w_trace(pstr, pn, tstr, tn, thre, &e);
+            set_one_mismatch_global_64(ez, thre, pn, tn, k);
+            bad = (e.err != ez->err || e.ps != ez->ps || e.pe != ez->pe || e.ts != ez->ts || e.te != ez->te || e.pl != ez->pl || e.tl != ez->tl || e.thre != ez->thre || e.nword != ez->nword || e.path.n != ez->path.n || e.cigar.n != ez->cigar.n
+                || e.done_cigar != ez->done_cigar || e.cigar_n != ez->cigar_n || e.done_path != ez->done_path || e.path_n != ez->path_n);
+            for (z = 0; !bad && z < e.cigar.n; z++) bad = (e.cigar.a[z] != ez->cigar.a[z]);
+            __sync_fetch_and_add(&ha_glb_n_check, 1); if (bad) __sync_fetch_and_add(&ha_glb_n_bad, 1);
+            free(e.cigar.a); free(e.path.a);
+#else
+            set_one_mismatch_global_64(ez, thre, pn, tn, k);
+#endif
+            return;
+        }
+    }
     if(nword <= 1) {
         ed_band_cal_global_64_w_trace(pstr, pn, tstr, tn, thre, ez);
     } else if(nword == 2) {
