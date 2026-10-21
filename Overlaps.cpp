@@ -1072,10 +1072,56 @@ void add_ma_hit_t_alloc(ma_hit_t_alloc* x, ma_hit_t* element)
 }
 
 
+#if defined(__x86_64__) && !defined(HA_NO_AVX512)
+#include <immintrin.h>
+#define HA_HAVE_OVLP_X16 1
+///the scalar loop of get_specific_overlap() 16 records at a time: one gather of their tn fields, then
+///the records with this tn in order, so the result is the first match as before. Returns -1 if no
+///match is in the first (n/16)*16 records; *done is the count of records that it looked at
+__attribute__((target("avx512f")))
+static long long get_specific_overlap_x16(const ma_hit_t *b, long long n, uint32_t qn, uint32_t tn, long long *done)
+{
+    const __m512i vidx = _mm512_mullo_epi32(_mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), _mm512_set1_epi32(sizeof(ma_hit_t)/4));
+    const __m512i vt = _mm512_set1_epi32((int)tn);
+    long long i;
+    for (i = 0; i + 16 <= n; i += 16) {
+        __mmask16 m = _mm512_cmpeq_epi32_mask(_mm512_i32gather_epi32(vidx, (const void*)&b[i].tn, 4), vt);
+        while (m) {
+            int k = __builtin_ctz(m);
+            if (((uint32_t)(b[i+k].qns>>32)) == qn) {
+                *done = i;
+                return i + k;
+            }
+            m &= m - 1;
+        }
+    }
+    *done = i;
+    return -1;
+}
+
+static int ovlp_probe_avx512(void)
+{
+    return (sizeof(ma_hit_t) % 4 == 0) && __builtin_cpu_supports("avx512f");
+}
+
+///the probe runs once: the initialization of a local static is thread-safe
+static int ovlp_use_avx512(void)
+{
+    static const int r = ovlp_probe_avx512();
+    return r;
+}
+#endif
+
 long long get_specific_overlap(ma_hit_t_alloc* x, uint32_t qn, uint32_t tn)
 {
-    long long i;
-    for (i = 0; i < x->length; i++)
+    long long i = 0;
+#ifdef HA_HAVE_OVLP_X16
+    if (x->length >= 16 && ovlp_use_avx512()) {
+        long long r = get_specific_overlap_x16(x->buffer, x->length, qn, tn, &i);
+        if (r >= 0) return r;
+    }
+#endif
+    for (; i < x->length; i++)
     {
         if(x->buffer[i].tn == tn 
         &&
@@ -1089,6 +1135,132 @@ long long get_specific_overlap(ma_hit_t_alloc* x, uint32_t qn, uint32_t tn)
 }
 
 
+
+///a compact copy of the tn of each overlap of each read, for the reverse-overlap search
+///(get_specific_overlap()) of the graph stage: it reads 4 bytes per overlap, not 40. The copy is valid
+///while the records [0, n[i]) of each list keep their place, qn and tn; the records appended after the
+///build are searched in the list itself, so the result is the same first match.
+typedef struct {
+    uint32_t *tn, *n, *rv; uint64_t *off; ma_hit_t_alloc *src;
+} ovlp_tn_t;
+
+static void ovlp_tn_worker(void *data, long i, int tid)///callback for kt_for()
+{
+    ovlp_tn_t *x = (ovlp_tn_t*)data;
+    uint64_t j;
+    for (j = 0; j < x->n[i]; j++) x->tn[x->off[i] + j] = x->src[i].buffer[j].tn;
+}
+
+static void ovlp_tn_build(ovlp_tn_t *x, ma_hit_t_alloc *src, uint64_t n_read)
+{
+    uint64_t i, tot = 0;
+    x->src = src;
+    x->n = (uint32_t*)malloc(sizeof(uint32_t) * (n_read + 1));
+    x->off = (uint64_t*)malloc(sizeof(uint64_t) * (n_read + 1));
+    for (i = 0; i < n_read; i++) x->off[i] = tot, x->n[i] = src[i].length, tot += src[i].length;
+    x->tn = (uint32_t*)malloc(sizeof(uint32_t) * (tot + 1)); x->rv = NULL;
+    kt_for(asm_opt.thread_num, ovlp_tn_worker, x, n_read);
+}
+
+static void ovlp_tn_destroy(ovlp_tn_t *x)
+{
+    free(x->tn); free(x->n); free(x->off); free(x->rv);
+}
+
+#if defined(__x86_64__) && !defined(HA_NO_AVX512)
+///the first k in [0, m) with a[k] == tn and the record k of list with qn; m if none
+__attribute__((target("avx512f")))
+static uint64_t ovlp_tn_scan16(const uint32_t *a, uint64_t m, const ma_hit_t *b, uint32_t qn, uint32_t tn)
+{
+    const __m512i vt = _mm512_set1_epi32((int)tn);
+    uint64_t k;
+    for (k = 0; k + 16 <= m; k += 16) {
+        __mmask16 h = _mm512_cmpeq_epi32_mask(_mm512_loadu_si512((const void*)(a + k)), vt);
+        while (h) {
+            int z = __builtin_ctz(h);
+            if (((uint32_t)(b[k+z].qns>>32)) == qn) return k + z;
+            h &= h - 1;
+        }
+    }
+    for (; k < m; k++)
+        if (a[k] == tn && ((uint32_t)(b[k].qns>>32)) == qn) return k;
+    return m;
+}
+#endif
+
+///get_specific_overlap(&src[rid], qn, tn) with the compact copy; list must be &src[rid]
+static inline long long ovlp_tn_get(const ovlp_tn_t *x, ma_hit_t_alloc *list, uint64_t rid, uint32_t qn, uint32_t tn)
+{
+    const uint32_t *a = x->tn + x->off[rid]; uint64_t m = x->n[rid], k;
+#ifdef HA_HAVE_OVLP_X16
+    if (ovlp_use_avx512()) {
+        k = ovlp_tn_scan16(a, m, list->buffer, qn, tn);
+        if (k < m) return k;
+    } else
+#endif
+    {
+        for (k = 0; k < m; k++)
+            if (a[k] == tn && ((uint32_t)(list->buffer[k].qns>>32)) == qn) return k;
+    }
+    for (k = m; k < list->length; k++)///the records appended after the build
+        if (list->buffer[k].tn == tn && ((uint32_t)(list->buffer[k].qns>>32)) == qn) return k;
+    return -1;
+}
+
+#define OVLP_TN_PF 8
+#define OVLP_TN_NONE ((uint32_t)-1)
+#define OVLP_TN_MU ((uint32_t)1<<31)///the target list has more than one record with the keys
+
+static void ovlp_tn_pair_worker(void *data, long i, int tid)///callback for kt_for()
+{
+    ovlp_tn_t *x = (ovlp_tn_t*)data;
+    const uint32_t *a; uint64_t j, k, f, m; uint32_t tn, r;
+    for (j = 0; j < x->n[i]; j++) {
+        tn = x->tn[x->off[i] + j]; a = x->tn + x->off[tn]; m = x->n[tn];
+        for (k = 0, f = 0, r = OVLP_TN_NONE; k < m; k++) {
+            if (a[k] == (uint32_t)i && ((uint32_t)(x->src[tn].buffer[k].qns>>32)) == tn) {
+                if (f++) { r |= OVLP_TN_MU; break; }
+                r = k;
+            }
+        }
+        x->rv[x->off[i] + j] = r;
+    }
+}
+
+///for each record j of each list i in the build: the index of the first record of src[tn] with the
+///keys (tn, i) in the build (OVLP_TN_MU set if there are more), or OVLP_TN_NONE; the records keep
+///their keys, so the pair stays valid
+static void ovlp_tn_pair(ovlp_tn_t *x, uint64_t n_read)
+{
+    x->rv = (uint32_t*)malloc(sizeof(uint32_t) * (x->off[n_read-1] + x->n[n_read-1] + 1));
+    kt_for(asm_opt.thread_num, ovlp_tn_pair_worker, x, n_read);
+}
+
+///the index of the first reverse record of the record z of the build, or OVLP_TN_NONE
+static inline uint32_t ovlp_tn_rvk(const ovlp_tn_t *x, uint64_t z)
+{
+    return x->rv[z] == OVLP_TN_NONE? OVLP_TN_NONE : x->rv[z] & ~OVLP_TN_MU;
+}
+
+///1 if the record j of the list i and its reverse record are the only records with their keys in
+///their lists and are their first reverse records (a simple pair)
+static inline int ovlp_tn_simple(const ovlp_tn_t *x, uint64_t i, uint64_t j)
+{
+    uint64_t z = x->off[i] + j; uint32_t r = x->rv[z], tn = x->tn[z];
+    if ((r & OVLP_TN_MU) || tn == i || ((uint32_t)(x->src[i].buffer[j].qns>>32)) != i) return 0;
+    return x->rv[x->off[tn] + r] == j;
+}
+
+///get_specific_overlap(&src[tn], tn, i) for the record j of the list i (tn is its target)
+static inline long long ovlp_tn_rev(const ovlp_tn_t *x, uint64_t i, uint64_t j, uint32_t tn)
+{
+    ma_hit_t_alloc *list = &(x->src[tn]); uint64_t k;
+    if (j >= x->n[i]) return ovlp_tn_get(x, list, tn, tn, i);
+    if (x->rv[x->off[i] + j] != OVLP_TN_NONE) return ovlp_tn_rvk(x, x->off[i] + j);
+    for (k = x->n[tn]; k < list->length; k++)///the records appended after the build
+        if (list->buffer[k].tn == i && ((uint32_t)(list->buffer[k].qns>>32)) == tn) return k;
+    return -1;
+}
 
 void set_reverse_overlap(ma_hit_t* dest, ma_hit_t* source)
 {
@@ -1136,19 +1308,80 @@ void set_reverse_overlap(ma_hit_t* dest, ma_hit_t* source)
 
 
 
-void normalize_ma_hit_t_single_side_advance(ma_hit_t_alloc* sources, long long num_sources, uint32_t recuse_el, uint8_t *cmk)
+///one visit of the serial loop of normalize_ma_hit_t_single_side_advance(): a is the record of qn,
+///b its reverse record (of tn)
+static inline void normalize_ma_hit_pair(ma_hit_t *a, ma_hit_t *b, uint32_t qn, uint32_t tn, uint32_t recuse_el, uint8_t *cmk)
 {
-    double startTime = Get_T();
+    uint32_t is_del = 0;
+    long long qLen_0, qLen_1;
+    if(a->del || b->del) is_del = 1;
 
+    qLen_0 = Get_qe(*a) - Get_qs(*a);
+    qLen_1 = Get_qe(*b) - Get_qs(*b);
+
+    if(qLen_0 == qLen_1) {
+        ///qn must be not equal to tn
+        ///make sources[qn] = sources[tn] if qn > tn
+        if(qn < tn) {
+            set_reverse_overlap(b, a);
+        }
+    } else if(qLen_0 > qLen_1) {
+        set_reverse_overlap(b, a);
+    }
+
+    if(recuse_el && a->el && b->el) is_del = 0;
+    if(cmk && (cmk[qn] <= asm_opt.chemical_cov/**FORCE_CUT**/ || cmk[tn] <= asm_opt.chemical_cov/**FORCE_CUT**/)) is_del = 1;
+    
+    a->del = is_del;
+    b->del = is_del;
+}
+
+typedef struct {
+    ovlp_tn_t *ix; uint32_t recuse_el; uint8_t *cmk, *sp;///sp: 1 for each record of a simple pair
+} normalize_aux_t;
+
+///sp of the records of the list i. A pass of its own: ovlp_tn_simple() reads qns, which
+///normalize_simple_worker() writes in the records of other lists.
+static void normalize_class_worker(void *data, long i, int tid)///callback for kt_for()
+{
+    normalize_aux_t *s = (normalize_aux_t*)data; ovlp_tn_t *x = s->ix; uint64_t j;
+    for (j = 0; j < x->n[i]; j++) s->sp[x->off[i] + j] = ovlp_tn_simple(x, i, j);
+}
+
+///the simple pairs of the list i with tn > i: both visits of the serial loop, in its order. The two
+///records of a simple pair are read and written by no other visit, so the pairs run in parallel.
+static void normalize_simple_worker(void *data, long i, int tid)///callback for kt_for()
+{
+    normalize_aux_t *s = (normalize_aux_t*)data; ovlp_tn_t *x = s->ix;
+    ma_hit_t *a, *b; uint64_t j, z; uint32_t tn;
+    for (j = 0; j < x->n[i]; j++) {
+        z = x->off[i] + j;
+        if (!s->sp[z]) continue;
+        tn = x->tn[z];
+        if (tn < (uint64_t)i) continue;
+        a = &(x->src[i].buffer[j]); b = &(x->src[tn].buffer[x->rv[z]]);
+        normalize_ma_hit_pair(a, b, i, tn, s->recuse_el, s->cmk);///the visit of the list i
+        normalize_ma_hit_pair(b, a, tn, i, s->recuse_el, s->cmk);///the visit of the list tn
+    }
+}
+
+///the serial loop; with sp it skips the simple pairs (normalize_simple_worker() did them)
+static void normalize_ma_hit_loop(ma_hit_t_alloc* sources, long long num_sources, uint32_t recuse_el, uint8_t *cmk, const ovlp_tn_t *ix, const uint8_t *sp)
+{
     long long i, j, index;
     uint32_t qn, tn, is_del = 0;
-    long long qLen_0, qLen_1;
     ma_hit_t ele;
     for (i = 0; i < num_sources; i++)
     {
 
         for (j = 0; j < sources[i].length; j++)
         {
+            if (j + OVLP_TN_PF < ix->n[i]) {///the reverse record of a later overlap of this read
+                uint64_t z = ix->off[i] + j + OVLP_TN_PF;
+                if (ix->rv[z] != OVLP_TN_NONE && !(sp && sp[z]))
+                    __builtin_prefetch(&(sources[ix->tn[z]].buffer[ovlp_tn_rvk(ix, z)]), 1);
+            }
+            if (sp && j < ix->n[i] && sp[ix->off[i] + j]) continue;
             qn = Get_qn(sources[i].buffer[j]);
             tn = Get_tn(sources[i].buffer[j]);
 
@@ -1156,32 +1389,17 @@ void normalize_ma_hit_t_single_side_advance(ma_hit_t_alloc* sources, long long n
 
             ///if(sources[i].buffer[j].del) continue;
 
-            index = get_specific_overlap(&(sources[tn]), tn, qn);
+            index = qn == i? ovlp_tn_rev(ix, i, j, tn) : ovlp_tn_get(ix, &(sources[tn]), tn, tn, qn);
+#ifdef HA_TNP_CHECK
+            if (index != get_specific_overlap(&(sources[tn]), tn, qn)) {
+                fprintf(stderr, "[E::%s] reverse pair differs: %lld %lld\n", __func__, i, j); exit(1);
+            }
+#endif
 
 
             ///if(index != -1 && sources[tn].buffer[index].del == 0)
             if(index != -1) {
-                is_del = 0;
-                if(sources[i].buffer[j].del || sources[tn].buffer[index].del) is_del = 1;
-
-                qLen_0 = Get_qe(sources[i].buffer[j]) - Get_qs(sources[i].buffer[j]);
-                qLen_1 = Get_qe(sources[tn].buffer[index]) - Get_qs(sources[tn].buffer[index]);
-
-                if(qLen_0 == qLen_1) {
-                    ///qn must be not equal to tn
-                    ///make sources[qn] = sources[tn] if qn > tn
-                    if(qn < tn) {
-                        set_reverse_overlap(&(sources[tn].buffer[index]), &(sources[i].buffer[j]));
-                    }
-                } else if(qLen_0 > qLen_1) {
-                    set_reverse_overlap(&(sources[tn].buffer[index]), &(sources[i].buffer[j]));
-                }
-
-                if(recuse_el && sources[i].buffer[j].el && sources[tn].buffer[index].el) is_del = 0;
-                if(cmk && (cmk[qn] <= asm_opt.chemical_cov/**FORCE_CUT**/ || cmk[tn] <= asm_opt.chemical_cov/**FORCE_CUT**/)) is_del = 1;
-                
-                sources[i].buffer[j].del = is_del;
-                sources[tn].buffer[index].del = is_del;
+                normalize_ma_hit_pair(&(sources[i].buffer[j]), &(sources[tn].buffer[index]), qn, tn, recuse_el, cmk);
             } else {///means this edge just occurs in one direction
                 is_del = 1; 
                 set_reverse_overlap(&ele, &(sources[i].buffer[j]));
@@ -1192,7 +1410,59 @@ void normalize_ma_hit_t_single_side_advance(ma_hit_t_alloc* sources, long long n
             }
         }
     }
+}
 
+#ifdef HA_NORM_CHECK
+///compare two copies of the lists field by field (cc only in the records of the build: the records
+///appended in the loop take cc from the stack)
+static void normalize_check(ma_hit_t_alloc *a, ma_hit_t_alloc *b, long long n, const uint32_t *n0)
+{
+    long long i, j, d = 0; ma_hit_t *x, *y;
+    for (i = 0; i < n; i++) {
+        if (a[i].length != b[i].length) { d++; continue; }
+        for (j = 0; j < a[i].length; j++) {
+            x = &(a[i].buffer[j]); y = &(b[i].buffer[j]);
+            if (x->qns != y->qns || x->qe != y->qe || x->tn != y->tn || x->ts != y->ts || x->te != y->te ||
+                x->ml != y->ml || x->rev != y->rev || x->bl != y->bl || x->del != y->del || x->el != y->el ||
+                x->no_l_indel != y->no_l_indel || (j < n0[i] && x->cc != y->cc)) d++;
+        }
+    }
+    fprintf(stderr, "[M::ha_norm_check] lists: %lld; different records: %lld\n", n, d);
+}
+#endif
+
+void normalize_ma_hit_t_single_side_advance(ma_hit_t_alloc* sources, long long num_sources, uint32_t recuse_el, uint8_t *cmk)
+{
+    double startTime = Get_T();
+    ovlp_tn_t ix; ovlp_tn_build(&ix, sources, num_sources);///the lists only grow here and keep their keys
+#ifdef HA_NORM_CHECK
+    ma_hit_t_alloc *ref; long long r; ovlp_tn_t rix;
+    CALLOC(ref, num_sources);
+    for (r = 0; r < num_sources; r++) {
+        ref[r].size = ref[r].length = sources[r].length;
+        MALLOC(ref[r].buffer, ref[r].size + 1);
+        memcpy(ref[r].buffer, sources[r].buffer, sizeof(ma_hit_t) * sources[r].length);
+    }
+    ovlp_tn_build(&rix, ref, num_sources);
+    if (num_sources > 0) ovlp_tn_pair(&rix, num_sources);
+    normalize_ma_hit_loop(ref, num_sources, recuse_el, cmk, &rix, NULL);
+#endif
+    normalize_aux_t s; s.ix = &ix; s.recuse_el = recuse_el; s.cmk = cmk; s.sp = NULL;
+    if (num_sources > 0) {
+        MALLOC(s.sp, ix.off[num_sources-1] + ix.n[num_sources-1] + 1);
+        ovlp_tn_pair(&ix, num_sources);
+        kt_for(asm_opt.thread_num, normalize_class_worker, &s, num_sources);
+        kt_for(asm_opt.thread_num, normalize_simple_worker, &s, num_sources);
+    }
+    normalize_ma_hit_loop(sources, num_sources, recuse_el, cmk, &ix, s.sp);
+    free(s.sp);
+#ifdef HA_NORM_CHECK
+    normalize_check(sources, ref, num_sources, ix.n);
+    for (r = 0; r < num_sources; r++) free(ref[r].buffer);
+    free(ref); ovlp_tn_destroy(&rix);
+#endif
+
+    ovlp_tn_destroy(&ix);
     if(VERBOSE >= 1)
     {
         fprintf(stderr, "[M::%s] takes %0.2fs\n\n", __func__, Get_T()-startTime);
@@ -1666,6 +1936,53 @@ void delete_all_edges(ma_hit_t_alloc* sources, ma_sub_t *coverage_cut, uint32_t 
     coverage_cut[qn].del = 1;
 }
 
+///get_specific_overlap_with_del(src, coverage_cut, tn, qn) for the record j of the list i (qn, tn are
+///its keys): the first record with these keys and del == 0 is not before the first one with these keys
+static ma_hit_t *ovlp_tn_rev_del(const ovlp_tn_t *x, ma_sub_t *coverage_cut, uint64_t i, uint64_t j)
+{
+    ma_hit_t *h = &(x->src[i].buffer[j]); ma_hit_t_alloc *list; const uint32_t *a;
+    uint32_t qn = Get_qn(*h), tn = Get_tn(*h); uint64_t k, m;
+    if (qn != i || j >= x->n[i]) return get_specific_overlap_with_del(x->src, coverage_cut, tn, qn);
+    if (coverage_cut[tn].del || coverage_cut[qn].del) return NULL;
+    list = &(x->src[tn]); a = x->tn + x->off[tn]; m = x->n[tn];
+    k = ovlp_tn_rvk(x, x->off[i] + j);
+    if (k == OVLP_TN_NONE) k = m;
+    for (; k < m; k++)
+        if (a[k] == qn && ((uint32_t)(list->buffer[k].qns>>32)) == tn && !list->buffer[k].del) return &(list->buffer[k]);
+    for (; k < list->length; k++)///the records appended after the build
+        if (Get_tn(list->buffer[k]) == qn && Get_qn(list->buffer[k]) == tn && !list->buffer[k].del) return &(list->buffer[k]);
+    return NULL;
+}
+
+///delete_single_edge(src, coverage_cut, tn, qn) for the record j of the list i
+static inline void ovlp_tn_del_rev(const ovlp_tn_t *x, ma_sub_t *coverage_cut, uint64_t i, uint64_t j)
+{
+    ma_hit_t *r = ovlp_tn_rev_del(x, coverage_cut, i, j);
+#ifdef HA_TNP_CHECK
+    if (r != get_specific_overlap_with_del(x->src, coverage_cut, Get_tn(x->src[i].buffer[j]), Get_qn(x->src[i].buffer[j]))) {
+        fprintf(stderr, "[E::%s] reverse record differs: %lu %lu\n", __func__, (unsigned long)i, (unsigned long)j); exit(1);
+    }
+#endif
+    if (r) r->del = 1;
+}
+
+///delete_all_edges() with the reverse records of ix
+static void ovlp_tn_del_all(const ovlp_tn_t *x, ma_sub_t *coverage_cut, uint32_t qn)
+{
+    ma_hit_t_alloc* l = &(x->src[qn]);
+    uint32_t i;
+    for (i = 0; i < l->length; i++) {
+        if (i + OVLP_TN_PF < x->n[qn]) {///the reverse record of a later overlap of this read
+            uint64_t z = x->off[qn] + i + OVLP_TN_PF;
+            if (x->rv[z] != OVLP_TN_NONE) __builtin_prefetch(&(x->src[x->tn[z]].buffer[ovlp_tn_rvk(x, z)]), 1);
+            __builtin_prefetch(&(coverage_cut[x->tn[z]]));
+        }
+        l->buffer[i].del = 1;
+        ovlp_tn_del_rev(x, coverage_cut, qn, i);
+    }
+    coverage_cut[qn].del = 1;
+}
+
 
 uint32_t get_real_sources_length(ma_hit_t_alloc* sources, ma_sub_t *coverage_cut, 
 int max_hang, int min_ovlp, uint32_t query)
@@ -1789,6 +2106,8 @@ R_to_U* ruIndex, int max_hang, int min_ovlp)
     ma_hit_t *h = NULL;
     ma_sub_t *sq = NULL;
     ma_sub_t *st = NULL;
+    ovlp_tn_t ix; ovlp_tn_build(&ix, sources, n_read);///the loop below changes only del
+    if (n_read > 0) ovlp_tn_pair(&ix, n_read);
 
 
     for (i = 0; i < n_read; ++i) 
@@ -1810,21 +2129,22 @@ R_to_U* ruIndex, int max_hang, int min_ovlp)
             if (r == MA_HT_QCONT) 
             {
                 h->del = 1;
-                delete_single_edge(sources, coverage_cut, Get_tn(*h), Get_qn(*h));
+                ovlp_tn_del_rev(&ix, coverage_cut, i, j);
         
-                delete_all_edges(sources, coverage_cut, Get_qn(*h));
+                ovlp_tn_del_all(&ix, coverage_cut, Get_qn(*h));
                 set_R_to_U(ruIndex, Get_qn(*h), Get_tn(*h), 0, NULL);
             }
 		    else if (r == MA_HT_TCONT) 
             {
                 h->del = 1;
-                delete_single_edge(sources, coverage_cut, Get_tn(*h), Get_qn(*h));
+                ovlp_tn_del_rev(&ix, coverage_cut, i, j);
 
-                delete_all_edges(sources, coverage_cut, Get_tn(*h));
+                ovlp_tn_del_all(&ix, coverage_cut, Get_tn(*h));
                 set_R_to_U(ruIndex, Get_tn(*h), Get_qn(*h), 0, NULL);
             }
         }
     }
+    ovlp_tn_destroy(&ix);
 
     transfor_R_to_U(ruIndex);
 
@@ -32913,13 +33233,14 @@ void try_rescue_overlaps(ma_hit_t_alloc* paf, ma_hit_t_alloc* rev, uint64_t rn, 
     kvec_t(uint64_t) ev; kv_init(ev);
     kvec_t(uint64_t) evi; kv_init(evi);
     kvec_t(uint32_t) b; kv_init(b);
+    ovlp_tn_t ix; ovlp_tn_build(&ix, paf, rn);///paf only grows here (rev is compacted, but not searched)
     
     for (i = 0; i < rn; i++) {
         ev.n = evi.n = 0;
         for (j = 0; j < rev[i].length; j++) {
             if(is_del && rev[i].buffer[j].del) continue;
             qn = Get_qn(rev[i].buffer[j]); tn = Get_tn(rev[i].buffer[j]);
-            dd = get_specific_overlap(&(paf[tn]), tn, qn);
+            dd = ovlp_tn_get(&ix, &(paf[tn]), tn, tn, qn);
             if((dd != -1) && ((!is_del) || (paf[tn].buffer[dd].del == 0))) {
                 ff = tn; ff <<= 32; ff |= (uint64_t)(dd);
                 kv_push(uint64_t, ev, ff); kv_push(uint64_t, evi, j);
@@ -32983,7 +33304,7 @@ void try_rescue_overlaps(ma_hit_t_alloc* paf, ma_hit_t_alloc* rev, uint64_t rn, 
     }
 
 
-    kv_destroy(ev); kv_destroy(evi); kv_destroy(b);
+    kv_destroy(ev); kv_destroy(evi); kv_destroy(b); ovlp_tn_destroy(&ix);
     if(VERBOSE >= 1) {
         fprintf(stderr, "[M::%s] took %0.2fs, rescue edges #: %ld\n\n", __func__, Get_T()-startTime, revises);
     }
@@ -33645,6 +33966,7 @@ R_to_U* ruIndex, int max_hang, int min_ovlp, uint32_t query, uint32_t target, as
     for (i = 0; i < x->length; i++)
     {
         h = &(x->buffer[i]);
+        if(Get_tn(*h) != (target>>1)) continue;///ma_hit2arc() sets t->v to tn<<1|dir
         sq = &(coverage_cut[Get_qn(*h)]);
         st = &(coverage_cut[Get_tn(*h)]);
     
@@ -33658,6 +33980,15 @@ R_to_U* ruIndex, int max_hang, int min_ovlp, uint32_t query, uint32_t target, as
         if(t->v != target) continue;
         
         return 1;
+    }
+
+    ///no match: t as the full scan leaves it, from the last record with r >= 0
+    for (i = x->length; i > 0; i--)
+    {
+        h = &(x->buffer[i-1]);
+        sq = &(coverage_cut[Get_qn(*h)]);
+        st = &(coverage_cut[Get_tn(*h)]);
+        if(ma_hit2arc(h, sq->e - sq->s, st->e - st->s, max_hang, asm_opt.max_hang_rate, min_ovlp, t) >= 0) break;
     }
 
     return 0;
