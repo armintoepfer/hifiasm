@@ -107,6 +107,66 @@ KRADIX_SORT_INIT(haplotype_evdience_srt, haplotype_evdience, haplotype_evdience_
 
 #define haplotype_evdience_id_key(x) ((x).overlapID)
 KRADIX_SORT_INIT(haplotype_evdience_id_srt, haplotype_evdience, haplotype_evdience_id_key, member_size(haplotype_evdience, overlapID))
+///radix_sort_haplotype_evdience_id_srt() with the same result: a level of rs_sort_*() whose keys all
+///have the same digit moves nothing and goes on with the same range, so the sort starts at the
+///highest digit that differs (overlapID is small: the high digits are the same)
+#ifdef HA_HEV_CHECK
+uint64_t ha_hev_n_check = 0, ha_hev_n_bad = 0;
+static void ha_hev_report(void) { fprintf(stderr, "[M::ha_hev_check] evidence sorts: %lu; different: %lu\n", (unsigned long)ha_hev_n_check, (unsigned long)ha_hev_n_bad); }
+static int ha_hev_report_set = atexit(ha_hev_report);
+#endif
+static void radix_sort_hev_id(haplotype_evdience *beg, haplotype_evdience *end)
+{
+    haplotype_evdience *p; uint32_t x = 0, k0; int s = sizeof(beg->overlapID) * 8 - 8;
+    if (end - beg <= RS_MIN_SIZE) {
+        rs_insertsort_haplotype_evdience_id_srt(beg, end);
+        return;
+    }
+    for (p = beg, k0 = beg->overlapID; p < end; ++p) x |= p->overlapID ^ k0;
+    if (x == 0) return;///no level moves an element
+    while (s > 0 && (x >> s) == 0) s -= 8;
+#ifdef HA_HEV_CHECK
+    {
+        int64_t n = end - beg, k; haplotype_evdience *c = (haplotype_evdience*)malloc(n * sizeof(*c));
+        memcpy(c, beg, n * sizeof(*c));
+        radix_sort_haplotype_evdience_id_srt(c, c + n);
+        rs_sort_haplotype_evdience_id_srt(beg, end, 8, s);
+        for (k = 0; k < n; k++)
+            if (c[k].site != beg[k].site || c[k].overlapID != beg[k].overlapID || c[k].overlapSite != beg[k].overlapSite || c[k].type != beg[k].type || c[k].cov != beg[k].cov || c[k].misBase != beg[k].misBase) break;
+        __sync_fetch_and_add(&ha_hev_n_check, 1); if (k < n) __sync_fetch_and_add(&ha_hev_n_bad, 1);
+        free(c);
+        return;
+    }
+#endif
+    rs_sort_haplotype_evdience_id_srt(beg, end, 8, s);
+}
+///radix_sort_haplotype_evdience_srt() with the same result, from the highest digit of site that differs
+///(as radix_sort_hev_id())
+static void radix_sort_hev_site(haplotype_evdience *beg, haplotype_evdience *end)
+{
+    haplotype_evdience *p; uint32_t x = 0, k0; int s = sizeof(beg->site) * 8 - 8;
+    if (end - beg <= RS_MIN_SIZE) {
+        rs_insertsort_haplotype_evdience_srt(beg, end);
+        return;
+    }
+    for (p = beg, k0 = beg->site; p < end; ++p) x |= p->site ^ k0;
+    if (x == 0) return;///no level moves an element
+    while (s > 0 && (x >> s) == 0) s -= 8;
+#ifdef HA_HEV_CHECK
+    {
+        int64_t n = end - beg, k; haplotype_evdience *c = (haplotype_evdience*)malloc(n * sizeof(*c));
+        memcpy(c, beg, n * sizeof(*c));
+        radix_sort_haplotype_evdience_srt(c, c + n);
+        rs_sort_haplotype_evdience_srt(beg, end, 8, s);
+        for (k = 0; k < n; k++)
+            if (c[k].site != beg[k].site || c[k].overlapID != beg[k].overlapID || c[k].overlapSite != beg[k].overlapSite || c[k].type != beg[k].type || c[k].cov != beg[k].cov || c[k].misBase != beg[k].misBase) break;
+        __sync_fetch_and_add(&ha_hev_n_check, 1); if (k < n) __sync_fetch_and_add(&ha_hev_n_bad, 1);
+        free(c);
+        return;
+    }
+#endif
+    rs_sort_haplotype_evdience_srt(beg, end, 8, s);
+}
 
 #define haplotype_evdience_os_key(x) ((x).overlapSite)
 KRADIX_SORT_INIT(haplotype_evdience_os_srt, haplotype_evdience, haplotype_evdience_os_key, member_size(haplotype_evdience, overlapSite))
@@ -7237,7 +7297,7 @@ haplotype_evdience_alloc* hap, UC_Read* overlap_read, int snp_threshold)
 
     RsetInitHaplotypeEvdienceFlag(hap, first_snp, last_snp + 1 - first_snp);
 
-    if(hap->length - ll > 1 && lr > 1) radix_sort_haplotype_evdience_srt(hap->list+ll, hap->list + hap->length);
+    if(hap->length - ll > 1 && lr > 1) radix_sort_hev_site(hap->list+ll, hap->list + hap->length);
 }
 
 void cluster_ul_advance(char* r_string, long long window_start, long long window_end, 
@@ -7393,7 +7453,7 @@ haplotype_evdience_alloc* hap, UC_Read* overlap_read, int snp_threshold, long lo
 
     RsetInitHaplotypeEvdienceFlag(hap, first_snp, last_snp + 1 - first_snp);
 
-    if(hap->length - ll > 1 && lr > 1) radix_sort_haplotype_evdience_srt(hap->list+ll, hap->list + hap->length);
+    if(hap->length - ll > 1 && lr > 1) radix_sort_hev_site(hap->list+ll, hap->list + hap->length);
 }
 
 
@@ -8674,7 +8734,7 @@ void generate_haplotypes_naive_advance(haplotype_evdience_alloc* hap, overlap_re
     int64_t z;
     SnpStats *s = NULL, *t = NULL;
     hap->snp_srt.n = 0;
-    radix_sort_haplotype_evdience_id_srt(hap->list, hap->list + hap->length);
+    radix_sort_hev_id(hap->list, hap->list + hap->length);
     for (k = 1, l = 0; k <= hap->length; ++k) {  
         if (k == hap->length || hap->list[k].overlapID != hap->list[l].overlapID) {
             for (i = l, o = 0; i < k; i++) {
@@ -8963,7 +9023,7 @@ void generate_haplotypes_naive_HiFi(haplotype_evdience_alloc* hap, overlap_regio
     
 
     hap->snp_srt.n = 0;
-    radix_sort_haplotype_evdience_id_srt(hap->list, hap->list + hap->length);
+    radix_sort_hev_id(hap->list, hap->list + hap->length);
     for (k = 1, l = 0; k <= hap->length; ++k) {  
         if (k == hap->length || hap->list[k].overlapID != hap->list[l].overlapID) {
             for (i = l, o = 0; i < k; i++) {
@@ -9196,7 +9256,7 @@ void generate_haplotypes_sv(haplotype_evdience_alloc* hap, overlap_region_alloc*
     if(hap->snp_stat.n == 0 || hap->length == 0) return;
 
     hap->snp_srt.n = 0;
-    radix_sort_haplotype_evdience_id_srt(hap->list, hap->list + hap->length);
+    radix_sort_hev_id(hap->list, hap->list + hap->length);
     for (k = 1, l = 0; k <= hap->length; ++k) {  
         if (k == hap->length || hap->list[k].overlapID != hap->list[l].overlapID) {
             for (i = l, o = 0; i < k; i++) {
@@ -9825,7 +9885,7 @@ void gen_rphase_dp(haplotype_evdience_alloc* hl, overlap_region_alloc* ol, UC_Re
                         fill_incom(res, hl->list[ii].overlapID, hl->list[ii].site, idx->a, idx->n, ol->list[0].x_id);
                         hl->list[m_list++] = hl->list[ii];
                     }
-                    radix_sort_haplotype_evdience_id_srt(hl->list + m1, hl->list + m_list);
+                    radix_sort_hev_id(hl->list + m1, hl->list + m_list);
                     for (ii = m_snp_stat0; ii < m_snp_stat; ii++) {
                         hl->snp_stat.a[ii].homopolymer_num = m_list;
                     }
@@ -9856,7 +9916,7 @@ void gen_rphase_dp(haplotype_evdience_alloc* hl, overlap_region_alloc* ol, UC_Re
             addHaplotypeEvdience(hl, &ev, NULL);
             // fprintf(stderr, "[M::%s]\toid::%u\tsite::%u\n", __func__, ev.overlapID, ev.site);
         }
-        radix_sort_haplotype_evdience_srt(hl->list, hl->list + hl->length);
+        radix_sort_hev_site(hl->list, hl->list + hl->length);
 
         for (k = 1, l = 0, i = 0; k <= hl->snp_stat.n; ++k) {
             if(k == hl->snp_stat.n || hl->snp_stat.a[k].site != hl->snp_stat.a[l].site) {
@@ -9891,7 +9951,7 @@ void gen_rphase_dp(haplotype_evdience_alloc* hl, overlap_region_alloc* ol, UC_Re
                         // fprintf(stderr, "[M::%s]\tid::[%u,%u]\tsite::[%u,%u]\n", __func__, hl->list[ii].overlapID, hl->list[ii-1].overlapID,  hl->list[ii].overlapSite,  hl->list[ii-1].overlapSite);
                     }
                 }
-                if(is_st == 0) radix_sort_haplotype_evdience_id_srt(hl->list + i, hl->list + i0);
+                if(is_st == 0) radix_sort_hev_id(hl->list + i, hl->list + i0);
                 // assert(is_st == 1);
 
                 
@@ -10017,7 +10077,7 @@ void generate_haplotypes_naive_UL(haplotype_evdience_alloc* hap, overlap_region_
     if(hap->snp_stat.n == 0 || hap->length == 0) return;
 
     hap->snp_srt.n = 0;
-    radix_sort_haplotype_evdience_id_srt(hap->list, hap->list + hap->length);
+    radix_sort_hev_id(hap->list, hap->list + hap->length);
     for (k = 1, l = 0; k <= hap->length; ++k) {  
         if (k == hap->length || hap->list[k].overlapID != hap->list[l].overlapID) {
             for (i = l, o = 0; i < k; i++) {
@@ -10589,7 +10649,7 @@ int push_info(haplotype_evdience_alloc* h, haplotype_evdience* a, uint64_t a_n, 
     uint64_t i, k, m, occ_0, occ_1[6], occ_2, diff, rev_n; uint8_t ihpc = 0;
     occ_0 = occ_2 = diff = rev_n = 0; memset(occ_1, 0, sizeof(uint64_t)*6);
 
-    radix_sort_haplotype_evdience_id_srt(a, a + a_n);
+    radix_sort_hev_id(a, a + a_n);
     for (k = 1, m = i = 0; k <= a_n; k++) {
         if((k == a_n) || (a[k].overlapID != a[m].overlapID)) {
             a[i] = a[m];
@@ -20333,7 +20393,7 @@ void rphase_hc_back(overlap_region_alloc* ol, All_reads *rref, haplotype_evdienc
         if(fi) {
             // if(is_dbg) fprintf(stderr, "-2-[M::%s]\ts::%ld\te::%ld\n", __func__, s, e);
             rr = hc_phase_robust_rr(ol->list, rref, hp, qu->seq, qu->length, tu, idx->a + srt_n, idx->n - srt_n, s, e, c_idx->a, 0, occ_thres, hpc_len/**, is_dbg**/);
-            if(hp->length > l0) radix_sort_haplotype_evdience_srt(hp->list + l0, hp->list + hp->length);
+            if(hp->length > l0) radix_sort_hev_site(hp->list + l0, hp->list + hp->length);
         }
 
         if(ei > si) memset(hp->flag + si, 0, (ei-si)*sizeof((*(hp->flag))));
@@ -20932,7 +20992,7 @@ void rphase_hc(overlap_region_alloc* ol, All_reads *rref, haplotype_evdience_all
         if(fi) {
             // if(is_dbg) fprintf(stderr, "-2-[M::%s]\ts::%ld\te::%ld\n", __func__, s, e);
             rr = hc_phase_robust_rr(ol->list, rref, hp, qu->seq, qu->length, tu, idx->a + srt_n, idx->n - srt_n, s, e, c_idx->a, 0, occ_thres, hpc_len/**, is_dbg**/);
-            if(hp->length > l0) radix_sort_haplotype_evdience_srt(hp->list + l0, hp->list + hp->length);
+            if(hp->length > l0) radix_sort_hev_site(hp->list + l0, hp->list + hp->length);
         }
 
         if(ei > si) memset(hp->flag + si, 0, (ei-si)*sizeof((*(hp->flag))));
