@@ -10909,6 +10909,13 @@ uint32_t cal_circle_ov(const ma_ug_t *ug, uint32_t uid, uint32_t rev, asg_t *sg)
     return 0;
 }
 
+#ifdef HA_MEMSTAT
+void ha_memstat(const char *tag);
+#define HA_MEMSTAT_AT(tag) ha_memstat(tag)
+#else
+#define HA_MEMSTAT_AT(tag)
+#endif
+
 void ma_ug_print2(const ma_ug_t *ug, All_reads *RNF, asg_t* read_g, const ma_sub_t *coverage_cut, 
 ma_hit_t_alloc* sources, R_to_U* ruIndex, int print_seq, const char* prefix, FILE *fp)
 {
@@ -39709,6 +39716,7 @@ long long bubble_dist, int read_graph, int write)
         write_all_data_to_disk(sources, reverse_sources, 
         &R_INF, output_file_name);
     }
+    HA_MEMSTAT_AT("graph start");
     ///debug_info_of_specfic_read("m64011_190830_220126/31720629/ccs", sources, reverse_sources, -1, "beg");
 
     if (!(asm_opt.flag & HA_F_BAN_ASSEMBLY))
@@ -39734,4 +39742,5 @@ long long bubble_dist, int read_graph, int write)
     }
 
     destory_R_to_U(&ruIndex); free(cmk);
+    HA_MEMSTAT_AT("graph end");
 }

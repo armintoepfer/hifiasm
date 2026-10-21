@@ -1118,6 +1118,7 @@ void *ha_ft_ul_gen(const hifiasm_opt_t *asm_opt, ma_utg_v *us, int k, int w, int
 	ha_ct_destroy(h);
 	fprintf(stderr, "[M::%s::%.3f*%.2f@%.3fGB] ==> filtered out %ld k-mers occurring %d or more times\n", __func__,
             yak_realtime(), yak_cpu_usage(), yak_peakrss_in_gb(), (long)kh_size(flt_tab), cutoff);
+	HA_MEMSTAT_AT("filter count end");
 	return (void*)flt_tab;
 }
 
@@ -1165,6 +1166,7 @@ void *ha_ft_gen(const hifiasm_opt_t *asm_opt, All_reads *rs, int *hom_cov, int i
 	ha_ct_destroy(h);
 	fprintf(stderr, "[M::%s::%.3f*%.2f@%.3fGB] ==> filtered out %ld k-mers occurring %d or more times\n", __func__,
 			yak_realtime(), yak_cpu_usage(), yak_peakrss_in_gb(), (long)kh_size(flt_tab), cutoff);
+	HA_MEMSTAT_AT("filter count end");
 	return (void*)flt_tab;
 }
 

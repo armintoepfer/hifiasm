@@ -112,6 +112,13 @@ double yak_realtime_0(void);
 double yak_realtime(void);
 long yak_peakrss(void);
 double yak_peakrss_in_gb(void);
+void ha_mem_trim(void);
+#ifdef HA_MEMSTAT
+void ha_memstat(const char *tag);
+#define HA_MEMSTAT_AT(tag) ha_memstat(tag)
+#else
+#define HA_MEMSTAT_AT(tag)
+#endif
 double yak_cpu_usage(void);
 
 void ha_triobin(const hifiasm_opt_t *opt);
