@@ -316,9 +316,13 @@ typedef struct {
 
 
 ///[s, e)
-int64_t extract_sub_cigar_mm(overlap_region *z, int64_t s, int64_t e, ul_ov_t *p, uint64_t *ct)
+template<bool range>
+int64_t extract_sub_cigar_mm(overlap_region *z, int64_t s, int64_t e, ul_ov_t *p, uint64_t *ct, int64_t ct_n)
 {
     int64_t wk = ovlp_cur_wid(*p), xk = ovlp_cur_xoff(*p), yk = ovlp_cur_yoff(*p), ck = ovlp_cur_coff(*p), os, oe, t;
+#ifdef HA_HAP_MM_RANGE_CHECK
+    uint64_t cells = 0, runs = 0;
+#endif
     bit_extz_t ez; int64_t bd = ovlp_bd(*p), s0, e0; 
     s0 = ((int64_t)(z->w_list.a[wk].x_start)) + bd; 
     e0 = ((int64_t)(z->w_list.a[wk].x_end)) + 1 - bd;
@@ -359,7 +363,25 @@ int64_t extract_sub_cigar_mm(overlap_region *z, int64_t s, int64_t e, ul_ov_t *p
         }
         
 
-        if(op == 0) {
+#ifdef HA_HAP_MM_RANGE_CHECK
+        if(!range) { cells += ((op != 2)? ((oe-os)*2-(os == ws)):1); runs++; }
+#endif
+        if(range) {
+            if(op != 2) {
+                uint64_t d = ((op == 0)? (uint64_t)0x100000001ULL:1);
+                int64_t end = (oe-s)<<1;
+                t = (os-s)<<1; ct[t] += d;
+                if(end < ct_n) ct[end] -= d;
+                t += 1 + ((os == ws)?2:0);
+                if(t < end) {
+                    ct[t] += d;
+                    if(end+1 < ct_n) ct[end+1] -= d;
+                }
+            } else {
+                t = ((ws-s)<<1)+1; ct[t]++;
+                if(t+2 < ct_n) ct[t+2]--;
+            }
+        } else if(op == 0) {
             for (t = os + 1; t < oe; t++) {
                 ct[(t-s)<<1]++; ct[(t-s)<<1] += ((uint64_t)(0x100000000));
                 ct[((t-s)<<1)+1]++; ct[((t-s)<<1)+1] += ((uint64_t)(0x100000000));
@@ -391,6 +413,12 @@ int64_t extract_sub_cigar_mm(overlap_region *z, int64_t s, int64_t e, ul_ov_t *p
     }
 
     ovlp_cur_xoff(*p) = xk; ovlp_cur_yoff(*p) = yk; ovlp_cur_coff(*p) = ck; ovlp_cur_ylen(*p) = 0;
+#ifdef HA_HAP_MM_RANGE_CHECK
+    if(!range) {
+        __sync_fetch_and_add(&mm_range_cells, cells);
+        __sync_fetch_and_add(&mm_range_runs, runs);
+    }
+#endif
     
     return 1;
 }
@@ -2221,6 +2249,11 @@ void prt_correct0_dbg(overlap_region *in)
 uint64_t wcns_vote(overlap_region* ol, All_reads *rref, char* qstr, uint64_t ql, UC_Read* tu, bit_extz_t *exz, uint64_t *id_a, uint64_t id_n, uint64_t s, uint64_t e, ul_ov_t *c_idx, cc_idx_t *occ, uint64_t occ_tot, double occ_exact, overlap_region *aux_o, asg32_v* b32, cns_gfa *cns, uint32_t rid, uint64_t *nec)
 {
     uint64_t k, q[2], rr = 0, os, oe, wl, oc[2], fI; ul_ov_t *p, *gp; overlap_region *z; 
+    wl = e - s;
+#ifdef HA_HAP_MM_RANGE_CHECK
+    uint64_t *old_ct = (uint64_t*)calloc(wl<<1, sizeof(uint64_t)), bad = 0, nonzero = 0, calls = 0;
+    for(k = 0; k < (wl<<1); k++) nonzero += (occ->idx->a[k] != 0);
+#endif
     // uint64_t *ct = occ->idx->a;///occ->idx->a[0, wl<<1)
     for (k = 0; k < id_n; k++) {
         p = &(c_idx[id_a[k]]); z = &(ol[ovlp_id(*p)]); 
@@ -2236,11 +2269,31 @@ uint64_t wcns_vote(overlap_region* ol, All_reads *rref, char* qstr, uint64_t ql,
             // assert(ovlp_id(*p) == ovlp_id(*gp));
             // fprintf(stderr, "[M::%s] tid::%u\t%.*s\twid::%u\tq::[%u, %u)\tos::%lu\toe::%lu\n", __func__, ol[ovlp_id(*p)].y_id, (int)Get_NAME_LENGTH(R_INF, ol[ovlp_id(*p)].y_id), Get_NAME(R_INF, ol[ovlp_id(*p)].y_id),
             // ovlp_cur_wid(*p), ol[ovlp_id(*p)].w_list.a[ovlp_cur_wid(*p)].x_start, ol[ovlp_id(*p)].w_list.a[ovlp_cur_wid(*p)].x_end+1, os, oe);
-            extract_sub_cigar_mm(z, os, oe, p, occ->idx->a + os - s);
+#ifdef HA_HAP_MM_RANGE_CHECK
+            ul_ov_t old_p = *p;
+            int64_t old_r = extract_sub_cigar_mm<false>(z, os, oe, &old_p, old_ct + os - s, 0);
+            int64_t new_r = extract_sub_cigar_mm<true>(z, os, oe, p, occ->idx->a + os - s, (wl<<1)-(os-s));
+            bad += (old_r != new_r || memcmp(&old_p, p, sizeof(old_p)) != 0); calls++;
+#else
+            extract_sub_cigar_mm<true>(z, os, oe, p, occ->idx->a + os - s, (wl<<1)-(os-s));
+#endif
         }
     }
 
-    wl = e - s;
+    ///The caller starts with zero counters. Preserve its unscaled os-s offset, including odd offsets.
+    uint64_t c0 = 0, c1 = 0;
+    for(k = 0; k < wl; k++) {
+        c0 += occ->idx->a[k<<1]; c1 += occ->idx->a[(k<<1)+1];
+        occ->idx->a[k<<1] = c0; occ->idx->a[(k<<1)+1] = c1;
+    }
+#ifdef HA_HAP_MM_RANGE_CHECK
+    for(k = 0; k < (wl<<1); k++) bad += (occ->idx->a[k] != old_ct[k]);
+    free(old_ct);
+    __sync_fetch_and_add(&mm_range_votes, 1);
+    __sync_fetch_and_add(&mm_range_calls, calls);
+    __sync_fetch_and_add(&mm_range_bad, bad);
+    __sync_fetch_and_add(&mm_range_nonzero, nonzero);
+#endif
     os = occ->mms; oe = occ->mme;
 
     // fprintf(stderr, "[M::%s] s::%lu\te::%lu\n", __func__, s, e);
