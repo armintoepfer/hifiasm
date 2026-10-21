@@ -10850,6 +10850,82 @@ ma_ug_t *gen_polished_ug(const ug_opt_t *uopt, asg_t *sg)
 
 
 // generate unitig sequences
+///the eLen bases of read rId that ma_ug_seq() copies to dst, from a decode of these bases only (not
+///the whole read): the same chars as the copy from recover_UC_Read(). 0: not done (a fake read, a read
+///without bases, or a copy longer than the read), use the old way
+static inline int ma_ug_copy_read(char *dst, uint32_t rId, uint32_t ori, uint32_t eLen, asg_t *read_g, const ma_sub_t *coverage_cut, UC_Read *buf)
+{
+    uint32_t k, readLen;
+    if(rId >= read_g->r_seq || Get_READ(R_INF, rId) == NULL) return 0;
+    readLen = coverage_cut[rId].e - coverage_cut[rId].s;
+    if(eLen > readLen) return 0;
+    if((int64_t)eLen + 4 > buf->size) {
+        buf->size = eLen + 4;
+        buf->seq = (char*)realloc(buf->seq, buf->size);
+    }
+    if (!ori) {// forward strand: bases [s, s + eLen)
+        recover_UC_Read_sub_region(dst, coverage_cut[rId].s, eLen, 0, &R_INF, rId);
+    } else {// reverse strand: the complement of bases [e - eLen, e), from the end
+        recover_UC_Read_sub_region(buf->seq, coverage_cut[rId].e - eLen, eLen, 0, &R_INF, rId);
+        for (k = 0; k < eLen; k++) {
+            uint8_t c = (uint8_t)buf->seq[eLen - 1 - k];
+            dst[k] = c >= 128? 'N' : comp_tab[c];
+        }
+    }
+    return 1;
+}
+
+///the bases of unitig u (u->s, u->len + 1 bytes): its reads in order, as ma_ug_seq() copies them
+static void ma_ug_seq_copy(ma_utg_t *u, asg_t *read_g, const ma_sub_t *coverage_cut, UC_Read *g_read, UC_Read *tmp)
+{
+	uint32_t j, k, rId, ori, start, eLen, readLen, l = 0;
+	char *readS = NULL;
+	u->s = (char*)calloc(1, u->len + 1);
+	memset(u->s, 'N', u->len);
+	for (j = 0; j < u->n; ++j) {
+		rId = u->a[j]>>33;
+		ori = u->a[j]>>32&1;
+		start = l;
+		eLen = (uint32_t)u->a[j];
+		l += eLen;
+
+		if(eLen == 0) continue;
+		if(ma_ug_copy_read(u->s + start, rId, ori, eLen, read_g, coverage_cut, g_read)) continue;
+		if(rId < read_g->r_seq) {
+			recover_UC_Read(g_read, &R_INF, rId);
+		} else {
+			recover_fake_read(g_read, tmp, &(read_g->F_seq[rId-read_g->r_seq]),
+			&R_INF, coverage_cut);
+		}
+
+		readS = g_read->seq + coverage_cut[rId].s;
+		readLen = coverage_cut[rId].e - coverage_cut[rId].s;
+
+		if (!ori) {// forward strand
+			for (k = 0; k < eLen; k++) {
+				u->s[start + k] = readS[k];
+			}
+		} else {
+			for (k = 0; k < eLen; k++) {
+				uint8_t c = (uint8_t)readS[readLen - 1 - k];
+				u->s[start + k] = c >= 128? 'N' : comp_tab[c];
+			}
+		}
+	}
+}
+
+typedef struct {
+	ma_ug_t *g; asg_t *read_g; const ma_sub_t *coverage_cut; UC_Read *g_read, *tmp;
+} ma_ug_seq_aux_t;
+
+static void ma_ug_seq_worker(void *data, long i, int tid)///callback for kt_for()
+{
+	ma_ug_seq_aux_t *a = (ma_ug_seq_aux_t*)data;
+	ma_utg_t *u = &a->g->u.a[i];
+	if(u->m == 0) return;
+	ma_ug_seq_copy(u, a->read_g, a->coverage_cut, &a->g_read[tid], &a->tmp[tid]);
+}
+
 int ma_ug_seq(ma_ug_t *g, asg_t *read_g, ma_sub_t *coverage_cut, ma_hit_t_alloc* sources, 
 kvec_asg_arc_t_warp* edge, int max_hang, int min_ovlp, kvec_asg_arc_t_warp *E, uint32_t is_polish)
 {
@@ -10857,15 +10933,16 @@ kvec_asg_arc_t_warp* edge, int max_hang, int min_ovlp, kvec_asg_arc_t_warp *E, u
     init_UC_Read(&g_read);
     UC_Read tmp;
     init_UC_Read(&tmp);
-	///utg_intv_t *tmp;
-	uint32_t i, j, k;
-    uint32_t rId, /**uId,**/ori, start, eLen, readLen;
-    char* readS = NULL;
+	uint32_t i, k;
+	int n_thread = asm_opt.thread_num > 0? asm_opt.thread_num : 1;
+	ma_ug_seq_aux_t aux;
     
     ///why we need n_read here? it is just beacuse one read can only be included in one untig
     ///but it is not true
 	///tmp = (utg_intv_t*)calloc(n_read, sizeof(utg_intv_t));
-	///number of unitigs
+	///number of unitigs: first the polish of each unitig, in order; then the bases of the unitigs, in
+	///parallel. The polish of a unitig changes only that unitig and E; the bases of a unitig come from
+	///that unitig, coverage_cut, R_INF and the fake reads of read_g, so they are the same.
 	for (i = 0; i < g->u.n; ++i) {
 		ma_utg_t *u = &g->u.a[i];
         if(u->m == 0) continue;
@@ -10875,41 +10952,13 @@ kvec_asg_arc_t_warp* edge, int max_hang, int min_ovlp, kvec_asg_arc_t_warp *E, u
         }
         
         g->g->seq[i].len = u->len;
-
-		uint32_t l = 0;
-		u->s = (char*)calloc(1, u->len + 1);
-		memset(u->s, 'N', u->len);
-		for (j = 0; j < u->n; ++j) {
-            rId = u->a[j]>>33;
-            ///uId = i;
-            ori = u->a[j]>>32&1;
-            start = l;
-            eLen = (uint32_t)u->a[j];
-			l += eLen;
-
-            if(eLen == 0) continue;
-            if(rId < read_g->r_seq) {
-                recover_UC_Read(&g_read, &R_INF, rId);
-            } else {
-                recover_fake_read(&g_read, &tmp, &(read_g->F_seq[rId-read_g->r_seq]),
-                &R_INF, coverage_cut);
-            }
-
-            readS = g_read.seq + coverage_cut[rId].s;
-            readLen = coverage_cut[rId].e - coverage_cut[rId].s;
-            
-            if (!ori) {// forward strand
-                for (k = 0; k < eLen; k++) {
-                    u->s[start + k] = readS[k];
-                }
-            } else {
-                for (k = 0; k < eLen; k++) {
-                    uint8_t c = (uint8_t)readS[readLen - 1 - k];
-                    u->s[start + k] = c >= 128? 'N' : comp_tab[c];
-                }
-            }
-		}
 	}
+	aux.g = g; aux.read_g = read_g; aux.coverage_cut = coverage_cut;
+	aux.g_read = (UC_Read*)calloc(n_thread, sizeof(UC_Read)); aux.tmp = (UC_Read*)calloc(n_thread, sizeof(UC_Read));
+	for (i = 0; i < (uint32_t)n_thread; ++i) init_UC_Read(&aux.g_read[i]), init_UC_Read(&aux.tmp[i]);
+	kt_for(n_thread, ma_ug_seq_worker, &aux, g->u.n);
+	for (i = 0; i < (uint32_t)n_thread; ++i) destory_UC_Read(&aux.g_read[i]), destory_UC_Read(&aux.tmp[i]);
+	free(aux.g_read); free(aux.tmp);
 
     destory_UC_Read(&g_read);
     destory_UC_Read(&tmp);
@@ -11059,6 +11108,7 @@ kvec_asg_arc_t_warp* edge, int max_hang, int min_ovlp, kvec_asg_arc_t_warp *E, u
 			l += eLen;
 
             if(eLen == 0) continue;
+            if(ma_ug_copy_read(u->s + start, rId, ori, eLen, read_g, coverage_cut, &g_read)) continue;
             if(rId < read_g->r_seq)
             {
                 recover_UC_Read(&g_read, &R_INF, rId);
