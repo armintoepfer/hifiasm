@@ -11995,39 +11995,79 @@ ma_hit_t_alloc* sources, R_to_U* ruIndex, const char* prefix, FILE *fp)
 	ma_ug_print2(ug, &R_INF, read_g, coverage_cut, sources, ruIndex, 0, prefix, fp);
 }
 
+///one (unitig, read) item of ma_ug_print_bed(): print_rough_inconsistent_sites() writes its text into
+///its own memory stream (or its intervals into its own list); the items are then joined in order
+typedef struct {
+    const ma_ug_t *g; asg_t *read_g; All_reads *RNF; ma_sub_t *coverage_cut; ma_hit_t_alloc* sources;
+    kvec_asg_arc_t_warp* edge; int max_hang, min_ovlp; uint32_t rate_thres; const char* prefix;
+    int to_file, to_bed;
+    uint32_t *it_u, *it_j, *it_beg;///the unitig, the read in the unitig, and its start in the unitig
+    char **txt; size_t *txt_l; bed_in *bed;///the output of each item
+    UC_Read *g_read, *tmp; kvec_t_u32_warp *exact_count, *total_count;///per thread
+} ma_ug_bed_aux_t;
+
+static void ma_ug_print_bed_worker(void *data, long k, int tid)///callback for kt_for()
+{
+    ma_ug_bed_aux_t *a = (ma_ug_bed_aux_t*)data;
+    ma_utg_t *u = &a->g->u.a[a->it_u[k]];
+    FILE *mf = NULL;
+    if(a->to_file) mf = open_memstream(&a->txt[k], &a->txt_l[k]);
+    print_rough_inconsistent_sites(u, a->it_j[k], a->it_j[k]+1, a->read_g, a->RNF, a->sources, a->coverage_cut, 
+    a->edge, &a->g_read[tid], &a->tmp[tid], a->max_hang, a->min_ovlp, a->it_beg[k], a->rate_thres, &a->exact_count[tid], 
+    &a->total_count[tid], a->to_file? a->prefix : NULL, a->it_u[k]+1, mf, a->to_bed? &a->bed[k]: NULL);
+    if(mf) fclose(mf);
+}
+
 void ma_ug_print_bed(const ma_ug_t *g, asg_t *read_g, All_reads *RNF, ma_sub_t *coverage_cut,
 ma_hit_t_alloc* sources, kvec_asg_arc_t_warp* edge, int max_hang, int min_ovlp, uint32_t rate_thres,
 const char* prefix, FILE *fp, trans_chain* t_ch)
 {
-	UC_Read g_read;
-    init_UC_Read(&g_read);
-    UC_Read tmp;
-    init_UC_Read(&tmp);
-    kvec_t_u32_warp exact_count, total_count;
-    kv_init(exact_count.a);
-    kv_init(total_count.a);
-    uint32_t i, j, l, eLen, start;
-    for (i = 0; i < g->u.n; ++i) {
+    ma_ug_bed_aux_t a; uint64_t n_it, k; uint32_t i, j, l, n_thread = asm_opt.thread_num > 0? asm_opt.thread_num : 1;
+    memset(&a, 0, sizeof(a));
+    a.g = g; a.read_g = read_g; a.RNF = RNF; a.coverage_cut = coverage_cut; a.sources = sources; a.edge = edge;
+    a.max_hang = max_hang; a.min_ovlp = min_ovlp; a.rate_thres = rate_thres; a.prefix = prefix;
+    ///print_rough_inconsistent_sites() prints if (prefix && fp), else it fills the intervals of t_ch
+    a.to_file = (prefix != NULL && fp != NULL); a.to_bed = (!a.to_file) && (t_ch != NULL);
+    for (i = n_it = 0; i < g->u.n; ++i) {
+        if(g->u.a[i].m == 0 || g->u.a[i].n < 2) continue;
+        n_it += g->u.a[i].n;
+    }
+    MALLOC(a.it_u, n_it); MALLOC(a.it_j, n_it); MALLOC(a.it_beg, n_it);
+    CALLOC(a.txt, n_it); CALLOC(a.txt_l, n_it); if(a.to_bed) CALLOC(a.bed, n_it);
+    for (i = k = 0; i < g->u.n; ++i) {
 		ma_utg_t *u = &g->u.a[i];
         if(u->m == 0) continue;
         if(u->n < 2) continue;
-        l = 0;
-        for (j = 0; j < u->n; ++j) 
-        {
-            start = l;
-            eLen = (uint32_t)u->a[j];
-			l += eLen;
-
-            print_rough_inconsistent_sites(u, j, j+1, read_g, RNF, sources, coverage_cut, 
-            edge, &g_read, &tmp, max_hang, min_ovlp, start, rate_thres, &exact_count, 
-            &total_count, prefix, i+1, fp, t_ch? &(t_ch->bed.a[i]): NULL);
+        for (j = l = 0; j < u->n; ++j) {
+            a.it_u[k] = i; a.it_j[k] = j; a.it_beg[k] = l; k++;
+            l += (uint32_t)u->a[j];
         }
     }
+    CALLOC(a.g_read, n_thread); CALLOC(a.tmp, n_thread); CALLOC(a.exact_count, n_thread); CALLOC(a.total_count, n_thread);
+    for (i = 0; i < n_thread; ++i) {
+        init_UC_Read(&a.g_read[i]); init_UC_Read(&a.tmp[i]);
+        kv_init(a.exact_count[i].a); kv_init(a.total_count[i].a);
+    }
 
-    destory_UC_Read(&g_read);
-    destory_UC_Read(&tmp);
-    kv_destroy(exact_count.a);
-    kv_destroy(total_count.a);
+    kt_for(n_thread, ma_ug_print_bed_worker, &a, n_it);
+
+    for (k = 0; k < n_it; ++k) {
+        if(a.to_file && a.txt_l[k] > 0) fwrite(a.txt[k], 1, a.txt_l[k], fp);
+        free(a.txt[k]);
+        if(a.to_bed) {
+            bed_in *d = &(t_ch->bed.a[a.it_u[k]]); bed_interval *p; size_t z;
+            for (z = 0; z < a.bed[k].n; ++z) {
+                kv_pushp(bed_interval, *d, &p); *p = a.bed[k].a[z];
+            }
+            free(a.bed[k].a);
+        }
+    }
+    for (i = 0; i < n_thread; ++i) {
+        destory_UC_Read(&a.g_read[i]); destory_UC_Read(&a.tmp[i]);
+        kv_destroy(a.exact_count[i].a); kv_destroy(a.total_count[i].a);
+    }
+    free(a.g_read); free(a.tmp); free(a.exact_count); free(a.total_count);
+    free(a.it_u); free(a.it_j); free(a.it_beg); free(a.txt); free(a.txt_l); free(a.bed);
 }
 
 uint32_t get_break_point_cov(ma_utg_t* collection, uint32_t cur_i, uint32_t next_i, 
