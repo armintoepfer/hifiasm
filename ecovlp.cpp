@@ -17,6 +17,42 @@
 #define RES_K 19
 #define RES_W 19
 
+#ifdef HA_FPACK_EQ_CHECK
+///the check build HA_FPACK_EQ_CHECK: each packed compare of the final pass also runs the decoded
+///compare (exact_ec_check); the counts are printed at exit
+static uint64_t ff_eq_n = 0, ff_eq_bad = 0, ff_eq_bases = 0, ff_eq_fallback = 0;
+static void ff_eq_report(void)
+{
+    fprintf(stderr, "[M::HA_FPACK_EQ_CHECK] checks %lu; different %lu; bases %lu; decoded fallbacks %lu\n",
+        (unsigned long)ff_eq_n, (unsigned long)ff_eq_bad, (unsigned long)ff_eq_bases,
+        (unsigned long)ff_eq_fallback);
+}
+static int ff_eq_report_set = atexit(ff_eq_report);
+#endif
+
+#ifdef HA_EA_PACK_CHECK
+static uint64_t ea_pack_n = 0, ea_pack_bad = 0, ea_pack_equal = 0, ea_pack_bases = 0;
+static void ea_pack_report(void)
+{
+    fprintf(stderr, "[M::HA_EA_PACK_CHECK] checks %lu; different %lu; equal %lu; packed bases %lu\n",
+        (unsigned long)ea_pack_n, (unsigned long)ea_pack_bad,
+        (unsigned long)ea_pack_equal, (unsigned long)ea_pack_bases);
+}
+static int ea_pack_report_set = atexit(ea_pack_report);
+#endif
+
+#ifdef HA_HAP_MM_RANGE_CHECK
+static uint64_t mm_range_votes = 0, mm_range_calls = 0, mm_range_bad = 0;
+static uint64_t mm_range_cells = 0, mm_range_runs = 0, mm_range_nonzero = 0;
+static void mm_range_report(void)
+{
+    fprintf(stderr, "[M::HA_HAP_MM_RANGE_CHECK] votes %lu; calls %lu; different %lu; old cells %lu; runs %lu; nonzero input %lu\n",
+        (unsigned long)mm_range_votes, (unsigned long)mm_range_calls, (unsigned long)mm_range_bad,
+        (unsigned long)mm_range_cells, (unsigned long)mm_range_runs, (unsigned long)mm_range_nonzero);
+}
+static int mm_range_report_set = atexit(mm_range_report);
+#endif
+
 KDQ_INIT(uint32_t)
 
 typedef struct {
@@ -2807,6 +2843,8 @@ inline uint64_t exact_ec_check(char *qstr, uint64_t ql, char *tstr, uint64_t tl,
     return 0;
 }
 
+static uint64_t exact_ec_check_packed(All_reads *rref, UC_Read *qu, UC_Read *tu, const overlap_region *z);
+
 void gen_hc_r_alin_ea(overlap_region_alloc* ol, Candidates_list *cl, All_reads *rref, UC_Read* qu, UC_Read* tu, bit_extz_t *exz, overlap_region *aux_o, double e_rate, int64_t wl, int64_t rid, int64_t khit, int64_t move_gap, asg16_v *buf, asg64_v *srt, ma_hit_t_alloc *in, uint8_t chem_drop, double align_gap_rate, int64_t align_gap_max)
 {
     if(ol->length <= 0) return;
@@ -2844,8 +2882,18 @@ void gen_hc_r_alin_ea(overlap_region_alloc* ol, Candidates_list *cl, All_reads *
                 p = &(in->buffer[(uint32_t)ei[i]]);
                 if((z->x_pos_s == ((uint32_t)p->qns)) && (z->x_pos_e + 1 == p->qe) && 
                             (z->y_pos_s == p->ts) && (z->y_pos_e + 1 == p->te)) {
+                    ///Both callers decoded the forward query from rref; the target chars are scratch.
+                    uint64_t eq = exact_ec_check_packed(rref, qu, tu, z);
+#ifdef HA_EA_PACK_CHECK
                     resize_UC_Read(tu, p->te - p->ts); recover_UC_Read_sub_region(tu->seq, p->ts, p->te - p->ts, trev, rref, tid);
-                    if(exact_ec_check(qu->seq, qu->length, tu->seq, p->te - p->ts, ((uint32_t)p->qns), p->qe, 0, p->te - p->ts)) {
+                    uint64_t old = exact_ec_check(qu->seq, qu->length, tu->seq, p->te - p->ts, ((uint32_t)p->qns), p->qe, 0, p->te - p->ts);
+                    __sync_fetch_and_add(&ea_pack_n, 1);
+                    __sync_fetch_and_add(&ea_pack_equal, eq);
+                    if (!rref->N_site[qu->RID] && !rref->N_site[tid] && Get_READ((*rref), qu->RID) && Get_READ((*rref), tid))
+                        __sync_fetch_and_add(&ea_pack_bases, p->te-p->ts);
+                    if (eq != old) __sync_fetch_and_add(&ea_pack_bad, 1);
+#endif
+                    if(eq) {
                         z->is_match = 1; z->shared_seed = z->non_homopolymer_errors;///for index
                         z->non_homopolymer_errors = 0; z->strong = z->without_large_indel = 0;
                         set_exact_exz(exz, z->x_pos_s, z->x_pos_e + 1, z->y_pos_s, z->y_pos_e + 1); push_alnw(z, exz);
@@ -5044,12 +5092,81 @@ overlap_region* h_ec_lchain_fast(ha_abuf_t *ab, uint32_t rid, UC_Read *qu, UC_Re
     return aux_o;
 }
 
+// Load exactly 32 packed bases; the last byte is needed only for an unaligned base offset.
+static inline uint64_t ff_pack32(const uint8_t *s, uint64_t pos)
+{
+    uint64_t v; const uint8_t *p = s + (pos>>2); unsigned shift = (pos&3)<<1;
+    memcpy(&v, p, sizeof(v));
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    v = __builtin_bswap64(v);
+#elif !defined(__BYTE_ORDER__) || __BYTE_ORDER__ != __ORDER_BIG_ENDIAN__
+    v = 0; for (unsigned i = 0; i < 8; i++) v = (v<<8) | p[i];
+#endif
+    if(shift) v = (v<<shift) | (p[8]>>(8-shift));
+    return v;
+}
+
+///1 if the query bases [x_pos_s, x_pos_e] equal the target bases [y_pos_s, y_pos_e] (on the strand
+///of z), compared in the 2-bit store, 32 bases at a time: no decode of the target region
+static uint64_t ff_pack_eq(All_reads *rref, uint64_t qid, const overlap_region *z)
+{
+    uint64_t tid = z->y_id, qs = z->x_pos_s, ts = z->y_pos_s, n = z->y_pos_e+1, rev = z->y_pos_strand;
+    n -= ts;
+    const uint8_t *q = Get_READ((*rref), qid), *t = Get_READ((*rref), tid);
+    uint64_t i, x, y, te = Get_READ_LENGTH((*rref), tid)-ts;
+    for (; n >= 32; qs += 32, ts += 32, te -= 32, n -= 32) {
+        x = ff_pack32(q, qs);
+        y = ff_pack32(t, rev? te-32 : ts);
+        if(rev) {
+            y = ((y&0x3333333333333333ULL)<<2) | ((y>>2)&0x3333333333333333ULL);
+            y = ((y&0x0f0f0f0f0f0f0f0fULL)<<4) | ((y>>4)&0x0f0f0f0f0f0f0f0fULL);
+            y = ~__builtin_bswap64(y);
+        }
+        if(x != y) return 0;
+    }
+    for (i = 0; i < n; i++) {
+        x = (q[(qs+i)>>2]>>(6-(((qs+i)&3)<<1)))&3;
+        uint64_t tp = rev? te-i-1 : ts+i;
+        y = (t[tp>>2]>>(6-((tp&3)<<1)))&3;
+        if(rev) y ^= 3;
+        if(x != y) return 0;
+    }
+    return 1;
+}
+
+///exact_ec_check() of the query (qu, the forward read) and the target region of z, without the decode
+///of the target; reads with N bases (N_site) take the decoded path
+static uint64_t exact_ec_check_packed(All_reads *rref, UC_Read *qu, UC_Read *tu, const overlap_region *z)
+{
+    uint64_t rid = qu->RID, tid = z->y_id, rev = z->y_pos_strand;
+    uint64_t qs = z->x_pos_s, qe = z->x_pos_e+1, ts = z->y_pos_s, te = z->y_pos_e+1;
+    uint64_t n = te-ts, eq;
+    // qu->RID keeps the stored query ID without the 32-bit conversion used by the chains.
+    // N positions and scaffold bases are not represented by the packed bases alone.
+    if(qe-qs == n && (rref->N_site[rid] || rref->N_site[tid] ||
+        !Get_READ((*rref), rid) || !Get_READ((*rref), tid))) {
+#ifdef HA_FPACK_EQ_CHECK
+        __sync_fetch_and_add(&ff_eq_fallback, 1);
+#endif
+        resize_UC_Read(tu, n); recover_UC_Read_sub_region(tu->seq, ts, n, rev, rref, tid);
+        return exact_ec_check(qu->seq, qu->length, tu->seq, n, qs, qe, 0, n);
+    }
+    eq = qe-qs == n? ff_pack_eq(rref, rid, z) : 0;
+#ifdef HA_FPACK_EQ_CHECK
+    resize_UC_Read(tu, n); recover_UC_Read_sub_region(tu->seq, ts, n, rev, rref, tid);
+    uint64_t old = exact_ec_check(qu->seq, qu->length, tu->seq, n, qs, qe, 0, n);
+    __sync_fetch_and_add(&ff_eq_n, 1); __sync_fetch_and_add(&ff_eq_bases, n);
+    if(eq != old) __sync_fetch_and_add(&ff_eq_bad, 1);
+#endif
+    return eq;
+}
+
 void h_ec_lchain_fast_new(ha_abuf_t *ab, uint32_t rid, UC_Read *qu, UC_Read *tu, All_reads *rref, overlap_region_alloc *ol, Candidates_list *cl, bit_extz_t *exz, asg16_v *buf, asg64_v *srt_i, ma_hit_t_alloc *in0, ma_hit_t_alloc *in1, double sh)
 {
     // fprintf(stderr, "-0-[M::%s]\tnew_n::%lu\told_n::%u\n", __func__, ol->length, in0->length + in1->length);
     // fprintf(stderr, "-mm-[M::%s]\tchain_cutoff::%u\n", __func__, chain_cutoff);
     uint64_t on = 0, k, i, l, m, m0, tid, trev, is_match, is_usrt = 0; ma_hit_t *oa = NULL, *p = NULL; overlap_region *z = NULL, t; 
-    char* rs = qu->seq; uint64_t rl = qu->length; int64_t om; uint64_t aq[2], at[2], bq[2], bt[2], ovlp, os, oe;
+    int64_t om; uint64_t aq[2], at[2], bq[2], bt[2], ovlp, os, oe;
     
 
     
@@ -5101,9 +5218,7 @@ void h_ec_lchain_fast_new(ha_abuf_t *ab, uint32_t rid, UC_Read *qu, UC_Read *tu,
 
             if(om) {
                 if(is_match == 1 && p->el == 1) p->el = 0;
-                resize_UC_Read(tu, bt[1] - bt[0]);
-                recover_UC_Read_sub_region(tu->seq, bt[0], bt[1] - bt[0], trev, rref, tid);
-                if(exact_ec_check(rs, rl, tu->seq, bt[1] - bt[0], bq[0], bq[1], 0, bt[1] - bt[0])) {
+                if(exact_ec_check_packed(rref, qu, tu, z)) {
                     if(is_match == 2) {
                         z->strong = 0; z->without_large_indel = 1;
                     }
@@ -5113,11 +5228,7 @@ void h_ec_lchain_fast_new(ha_abuf_t *ab, uint32_t rid, UC_Read *qu, UC_Read *tu,
             }
         } else {
             om = 0;
-            bq[0] = z->x_pos_s; bq[1] = z->x_pos_e + 1;
-            bt[0] = z->y_pos_s; bt[1] = z->y_pos_e + 1;
-            resize_UC_Read(tu, bt[1] - bt[0]);
-            recover_UC_Read_sub_region(tu->seq, bt[0], bt[1] - bt[0], trev, rref, tid);
-            if(exact_ec_check(rs, rl, tu->seq, bt[1] - bt[0], bq[0], bq[1], 0, bt[1] - bt[0])) {
+            if(exact_ec_check_packed(rref, qu, tu, z)) {
                 z->strong = 0; z->without_large_indel = 1;
                 z->shared_seed = 1; z->is_match = 1; om = 1;
             }
