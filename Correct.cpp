@@ -12637,9 +12637,12 @@ void prt_cigar(uint16_t *ca, uint32_t cn)
 
 
 inline uint32_t gen_backtrace_adv_exz(window_list *p, overlap_region *z, All_reads *rref, hpc_t *hpc_g, const ul_idx_t *uref, 
-char *qstr, char *tstr, bit_extz_t *exz, uint32_t rev, uint32_t id)
+char *qstr, char *tstr, bit_extz_t *exz, uint32_t rev, uint32_t id, const hc_tb8_path_t *tb = NULL)
 {
     if(p->error < 0 || p->y_end < 0) return 0;
+#ifdef HA_TB8_CHECK
+    __sync_fetch_and_add(&ha_tb8_requested, 1);
+#endif
     int64_t qs, qe, ql, tl, aln_l, t_pri_l, thres, ts, t_tot_l; 
     int64_t aux_beg, aux_end;
     char *q_string, *t_string; 
@@ -12662,7 +12665,9 @@ char *qstr, char *tstr, bit_extz_t *exz, uint32_t rev, uint32_t id)
     }
     
     q_string = qstr + qs; tl = t_pri_l;
-    if(rref) {
+    if(tb && rref) {
+        memcpy(tstr, tb->pstr, tl); t_string = tstr;
+    } else if(rref) {
         recover_UC_Read_sub_region(tstr, ts, t_pri_l, rev, rref, id); t_string = tstr;
     } else {
         t_string = return_str_seq_exz(tstr, ts, t_pri_l, rev, hpc_g, uref, id);
@@ -12672,7 +12677,8 @@ char *qstr, char *tstr, bit_extz_t *exz, uint32_t rev, uint32_t id)
     exz->ps = -1; exz->pe = p->y_end-p->y_start; exz->pl = tl;  
     exz->err = p->error; exz->thre = p->error_threshold; 
     // clear_align(*exz);
-    ed_band_cal_semi_64_w_absent_diag_trace(t_string, tl, q_string, ql, thres, aux_beg, exz);
+    if (tb) hc_tb8_gen_trace(t_string, tl, q_string, ql, thres, aux_beg, exz, tb);
+    else ed_band_cal_semi_64_w_absent_diag_trace(t_string, tl, q_string, ql, thres, aux_beg, exz);
     // if(id == 178 && p->x_start == 86800 && p->x_end == 86807) {
     //     fprintf(stderr, "\n[M::%s::semi] exz->ps::%d, exz->pe::%d, exz->ts::%d, exz->te::%d, exz->err::%d, exz->cigar.n::%d\n", 
     //     __func__, exz->ps, exz->pe, exz->ts, exz->te, exz->err, (int32_t)exz->cigar.n);
@@ -12717,6 +12723,9 @@ char *qstr, char *tstr, bit_extz_t *exz, uint32_t rev, uint32_t id)
 inline uint32_t gen_backtrace_non_retrieve_adv_exz(window_list *p, overlap_region *z, char *qstr, char *tstr, int64_t t_tot_l, bit_extz_t *exz, uint32_t rev, uint32_t id)
 {
     if(p->error < 0 || p->y_end < 0) return 0;
+#ifdef HA_TB8_CHECK
+    __sync_fetch_and_add(&ha_tb8_requested, 1);
+#endif
     int64_t qs, qe, ql, tl, aln_l, t_pri_l, thres, ts; 
     int64_t aux_beg, aux_end;
     char *q_string, *t_string; 
@@ -13314,6 +13323,135 @@ static void ed_band_cal_semi_64_x8_avx512(char **pstr, int32_t pn, char **tstr, 
         if ((int64_t)ev[l] > cut) continue;///dead: the scalar kernel returned early
         ed_semi_64_end_scan(vp[l], vn[l], ev[l], pn, tn, thre, &res[l]);
     }
+}
+
+///Only requested, seeded traces with equal pn, tn, thre and abs_diag enter this kernel.
+///Scatter writes each lane in the scalar trace layout: D0, HP, HN (plus VP/VN in check builds).
+///The seeded err and pe stay unchanged, as in the scalar trace kernel.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
+static void ed_band_cal_semi_64_trace_x8_avx512(char **pstr, int32_t pn, char **tstr, int32_t tn,
+    int32_t thre, int32_t abs_diag, int32_t n, w_sig *path, hc_tb8_path_t *res)
+{
+    static __thread uint8_t *qc = NULL, *tc = NULL; static __thread int64_t qc_m = 0, tc_m = 0;
+    Word P[4][HC_NL], off[HC_NL];
+    int32_t i, l, bd = MIN(((thre<<1)+1)-abs_diag, pn), i_bd = (thre<<1)-abs_diag;
+    if (qc_m < (int64_t)tn * HC_NL) { qc_m = (int64_t)tn * HC_NL; qc = (uint8_t*)realloc(qc, qc_m); }
+    if (tc_m < (int64_t)pn * HC_NL) { tc_m = (int64_t)pn * HC_NL; tc = (uint8_t*)realloc(tc, tc_m); }
+    if (hc_use_vbmi()) {
+        hc_transpose8_vbmi(tstr, n, tn, qc); hc_transpose8_vbmi(pstr, n, pn, tc);
+    } else {
+        for (i = 0; i < tn; i++) {
+            for (l = 0; l < n; l++) qc[i*HC_NL+l] = seq_nt4_table[(uint8_t)tstr[l][i]];
+            for (; l < HC_NL; l++) qc[i*HC_NL+l] = 4;
+        }
+        for (i = 0; i < pn; i++) {
+            for (l = 0; l < n; l++) tc[i*HC_NL+l] = seq_nt4_table[(uint8_t)pstr[l][i]];
+            for (; l < HC_NL; l++) tc[i*HC_NL+l] = 4;
+        }
+    }
+    memset(P, 0, sizeof(P));
+    for (l = 0; l < HC_NL; l++) {
+        Word mm = (Word)1 << abs_diag;
+        off[l] = (int64_t)l * tn * HA_TRACE_WORDS;
+        for (i = 0; i < bd; i++, mm <<= 1) {
+            uint8_t c = tc[i*HC_NL+l];
+            if (c < 4) P[c][l] |= mm;
+        }
+        if (l < n) {
+            res[l].a = path + off[l]; res[l].n = (size_t)tn * HA_TRACE_WORDS;
+            res[l].pstr = pstr[l]; res[l].done = 1;
+        }
+    }
+    __m512i P0 = _mm512_loadu_si512(P[0]), P1 = _mm512_loadu_si512(P[1]), P2 = _mm512_loadu_si512(P[2]), P3 = _mm512_loadu_si512(P[3]);
+    __m512i VP = _mm512_setzero_si512(), VN = _mm512_set1_epi64(((Word)1 << abs_diag)-1);
+    __m512i err = _mm512_set1_epi64(abs_diag);
+    const __m512i one = _mm512_set1_epi64(1), mm = _mm512_set1_epi64((Word)1 << (thre<<1));
+    const __m512i c0 = _mm512_setzero_si512(), c1 = _mm512_set1_epi64(1), c2 = _mm512_set1_epi64(2), c3 = _mm512_set1_epi64(3);
+    const __m512i cut = _mm512_set1_epi64(thre + (thre<<1)), offsets = _mm512_loadu_si512(off);
+    __mmask8 live = (__mmask8)((1U<<n)-1);
+    w_sig *pa = path;
+    for (i = 0; i < tn; i++, pa += HA_TRACE_WORDS) {
+        __m512i cv = _mm512_cvtepu8_epi64(_mm_loadl_epi64((const __m128i*)(qc + (int64_t)i*HC_NL)));
+        __m512i X = VN, D0, HN, HP;
+        X = _mm512_mask_or_epi64(X, _mm512_cmpeq_epi64_mask(cv, c0), X, P0);
+        X = _mm512_mask_or_epi64(X, _mm512_cmpeq_epi64_mask(cv, c1), X, P1);
+        X = _mm512_mask_or_epi64(X, _mm512_cmpeq_epi64_mask(cv, c2), X, P2);
+        X = _mm512_mask_or_epi64(X, _mm512_cmpeq_epi64_mask(cv, c3), X, P3);
+        D0 = _mm512_or_si512(_mm512_xor_si512(_mm512_add_epi64(VP, _mm512_and_si512(X, VP)), VP), X);
+        HN = _mm512_and_si512(VP, D0);
+        HP = _mm512_or_si512(VN, _mm512_ternarylogic_epi64(VP, D0, D0, 0x03));
+        X = _mm512_srli_epi64(D0, 1);
+        VN = _mm512_and_si512(X, HP);
+        VP = _mm512_or_si512(HN, _mm512_ternarylogic_epi64(X, HP, HP, 0x03));
+        err = _mm512_add_epi64(err, _mm512_andnot_si512(D0, one));
+        __mmask8 dead = live & _mm512_cmpgt_epu64_mask(err, cut);
+        if (dead) {
+            for (l = 0; l < n; l++) if (dead & (1U<<l)) { res[l].n = (size_t)i * HA_TRACE_WORDS; res[l].done = 0; }
+            live &= ~dead;
+            if (!live) break;
+        }
+        _mm512_mask_i64scatter_epi64(pa, live, offsets, D0, 8);
+        if (HA_TRACE_WORDS == 5) {
+            _mm512_mask_i64scatter_epi64(pa+1, live, offsets, VP, 8);
+            _mm512_mask_i64scatter_epi64(pa+2, live, offsets, VN, 8);
+        }
+        _mm512_mask_i64scatter_epi64(pa+HA_TRACE_WORDS-2, live, offsets, HP, 8);
+        _mm512_mask_i64scatter_epi64(pa+HA_TRACE_WORDS-1, live, offsets, HN, 8);
+        if (i == tn-1) break;
+        P0 = _mm512_srli_epi64(P0, 1); P1 = _mm512_srli_epi64(P1, 1); P2 = _mm512_srli_epi64(P2, 1); P3 = _mm512_srli_epi64(P3, 1);
+        if (++i_bd < pn) {
+            __m512i tv = _mm512_cvtepu8_epi64(_mm_loadl_epi64((const __m128i*)(tc + (int64_t)i_bd*HC_NL)));
+            P0 = _mm512_mask_or_epi64(P0, _mm512_cmpeq_epi64_mask(tv, c0), P0, mm);
+            P1 = _mm512_mask_or_epi64(P1, _mm512_cmpeq_epi64_mask(tv, c1), P1, mm);
+            P2 = _mm512_mask_or_epi64(P2, _mm512_cmpeq_epi64_mask(tv, c2), P2, mm);
+            P3 = _mm512_mask_or_epi64(P3, _mm512_cmpeq_epi64_mask(tv, c3), P3, mm);
+        }
+    }
+}
+
+///shortcut: one compatible group per 32 windows; use occupancy before adding more groups.
+static int32_t hc_tb8_prepare(overlap_region *z, int64_t k, int64_t qs, int64_t qe, All_reads *rref,
+    hpc_t *hpc_g, const ul_idx_t *uref, char *qstr, int64_t *next, int64_t *wid, hc_tb8_path_t *res)
+{
+    static __thread w64_trace_t path = {0, 0, NULL};
+    static __thread char *tb = NULL; static __thread int64_t tb_m = 0;
+    window_list *p = &z->w_list.a[k];
+    int64_t tn = (int64_t)p->x_end+1-p->x_start, thre = p->error_threshold, abs_diag = p->extra_begin;
+    int64_t tot, pn, j; int32_t n = 0; char *lp[HC_NL], *lt[HC_NL];
+    *next = k+1;
+    if (p->error <= 0 || p->error > thre || thre > 31 || abs_diag < 0 || abs_diag > (thre<<1) || tn <= 0) return 0;
+    if(hpc_g) tot = hpc_len(*hpc_g, z->y_id);
+    else if(uref) tot = uref->ug->u.a[z->y_id].len;
+    else tot = Get_READ_LENGTH((*rref), z->y_id);
+    pn = p->extra_end >= 0? tn + (thre<<1) - abs_diag - p->extra_end : MIN(tot-p->y_start, tn+(thre<<1)-abs_diag);
+    if (pn <= 0 || pn > tn + thre*3 || tn > pn + thre*3 || pn > INT32_MAX/HC_NL || tn > INT32_MAX/HC_NL) return 0;
+    for (j = k; j < (int64_t)z->w_list.n && j-k < HC_NB && n < HC_NL; j++) {
+        p = &z->w_list.a[j];
+        if (p->x_start >= qe) break;
+        if (p->x_end < qs || p->clen || p->y_end < 0 || p->error <= 0 || p->error > thre ||
+            (int64_t)p->x_end+1-p->x_start != tn || p->error_threshold != thre || p->extra_begin != abs_diag) continue;
+        int64_t pl = p->extra_end >= 0? tn + (thre<<1) - abs_diag - p->extra_end : MIN(tot-p->y_start, tn+(thre<<1)-abs_diag);
+        if (pl != pn) continue;
+        wid[n++] = j;
+    }
+    *next = j;
+    if (n < 2) return 0;
+    if (tb_m < pn*n) { tb_m = pn*n; tb = (char*)realloc(tb, tb_m); }
+    kv_resize(w_sig, path, (size_t)tn*HA_TRACE_WORDS*n);
+    for (j = 0; j < n; j++) {
+        p = &z->w_list.a[wid[j]];
+        lp[j] = tb + j*pn; lt[j] = qstr + p->x_start;
+        if(rref) recover_UC_Read_sub_region(lp[j], p->y_start, pn, z->y_pos_strand, rref, z->y_id);
+        else {
+            char *s = return_str_seq_exz(lp[j], p->y_start, pn, z->y_pos_strand, hpc_g, uref, z->y_id);
+            if (s != lp[j]) memcpy(lp[j], s, pn);
+        }
+    }
+    ed_band_cal_semi_64_trace_x8_avx512(lp, pn, lt, tn, thre, abs_diag, n, path.a, res);
+#ifdef HA_TB8_CHECK
+    __sync_fetch_and_add(&ha_tb8_batches, 1);
+#endif
+    return n;
 }
 
 static int hc_probe_avx512(void)
@@ -17428,6 +17566,10 @@ int64_t ql, int64_t tl, double e_rate, int64_t h_khit, int64_t mode, int64_t rid
 {
     assert(mode < 3);
     int64_t k, ws, we, os, oe, wsk, rcn = cl->length, ncn, occ = 0, ovlp, wn = z->w_list.n; asg16_v ez; uint32_t w = 1;
+#ifdef HC_HAVE_AVX512
+    hc_tb8_path_t tb[HC_NL]; int64_t tb_wid[HC_NL], tb_next = 0;
+    int32_t tb_n = 0, tb_i = 0, use_tb8 = hc_use_avx512();
+#endif
     ws = qs; if(ws < z->x_pos_s) ws = z->x_pos_s; 
     we = qe-1; if(we > z->x_pos_e) we = z->x_pos_e; 
     wsk = get_win_id_by_s(z, ((ws/wl)*wl), wl, NULL); 
@@ -17453,6 +17595,14 @@ int64_t ql, int64_t tl, double e_rate, int64_t h_khit, int64_t mode, int64_t rid
         os = MAX(qs, ws); oe = MIN(qe, we); ovlp = ((oe>os)? (oe-os):0);
         if(!ovlp) continue;
         if(!(z->w_list.a[k].clen)) {
+#ifdef HC_HAVE_AVX512
+            if (use_tb8 && k >= tb_next) {
+                tb_n = hc_tb8_prepare(z, k, qs, qe, rref, hpc_g, uref, qstr, &tb_next, tb_wid, tb); tb_i = 0;
+            }
+            if (tb_i < tb_n && tb_wid[tb_i] == k) {
+                gen_backtrace_adv_exz(&(z->w_list.a[k]), z, rref, hpc_g, uref, qstr, tu->seq, exz, z->y_pos_strand, z->y_id, &tb[tb_i++]);
+            } else
+#endif
             gen_backtrace_adv_exz(&(z->w_list.a[k]), z, rref, hpc_g, uref, qstr, tu->seq, exz, z->y_pos_strand, z->y_id);
         }
         ez.a = z->w_list.c.a + z->w_list.a[k].cidx; 
