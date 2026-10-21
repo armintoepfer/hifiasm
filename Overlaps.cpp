@@ -19,6 +19,9 @@
 #include "gfa_ut.h"
 #include "assert.h"
 #include "khash.h"
+#include <pthread.h>
+#include <stdarg.h>
+#include <unistd.h>
 #include "ecovlp.h"
 
 KHASH_SET_INIT_INT64(64)
@@ -11343,46 +11346,206 @@ void ha_memstat(const char *tag);
 #define HA_MEMSTAT_AT(tag)
 #endif
 
-void ma_ug_print2(const ma_ug_t *ug, All_reads *RNF, asg_t* read_g, const ma_sub_t *coverage_cut, 
-ma_hit_t_alloc* sources, R_to_U* ruIndex, int print_seq, const char* prefix, FILE *fp)
-{
-    uint8_t* primary_flag = read_g?(uint8_t*)calloc(read_g->n_seq, sizeof(uint8_t)):NULL;
-	uint32_t i, j, l, pc = read_g && coverage_cut && sources && ruIndex?1:0, co;
-	char name[32];
-	for (i = 0; i < ug->u.n; ++i) { // the Segment lines in GFA
-		ma_utg_t *p = &ug->u.a[i];
-        if(p->m == 0) continue;
-        sprintf(name, "%s%.6d%c", prefix, i + 1, "lc"[p->circ]);
-		if (print_seq) fprintf(fp, "S\t%s\t%s\tLN:i:%d\trd:i:%u\n", name, p->s? p->s : "*", p->len, 
-        pc?get_ug_coverage(p, read_g, coverage_cut, sources, ruIndex, primary_flag, NULL, NULL):0);
-		else fprintf(fp, "S\t%s\t*\tLN:i:%d\trd:i:%u\n", name, p->len, 
-        pc?get_ug_coverage(p, read_g, coverage_cut, sources, ruIndex, primary_flag, NULL, NULL):0);
-        
-		for (j = l = 0; j < p->n; j++) {
-            if(p->a[j] != (uint64_t)-1)
-            {
-                uint32_t x = p->a[j]>>33;
-                if(x<RNF->total_reads)
-                {
+///background writes of the output files (the bin files, the GFA text): the bytes are in memory, a thread
+///writes them, and an atexit() handler waits for the threads. The graph stage does not wait for the disk.
+///A job writes a whole file (fn) or a range of an open file (fd, off).
+typedef struct {
+    char *fn; int fd; int64_t off; uint8_t *b; uint64_t n; pthread_t t;
+} bgw_t;
 
-                    fprintf(fp, "A\t%s\t%d\t%c\t%.*s\t%d\t%d\tid:i:%d\tHG:A:%c\n", name, l, "+-"[p->a[j]>>32&1],
-                    (int)Get_NAME_LENGTH((*RNF), x), Get_NAME((*RNF), x), 
-                    coverage_cut?coverage_cut[x].s:0, coverage_cut?coverage_cut[x].e:(int)Get_READ_LENGTH((*RNF), x), x, 
-                    "apmaaa"[((RNF->trio_flag[x]!=FATHER && RNF->trio_flag[x]!=MOTHER)?AMBIGU:RNF->trio_flag[x])]);
-                }
-                else
-                {
-                    fprintf(fp, "A\t%s\t%d\t%c\t%s\t%d\t%d\tid:i:%d\tHG:A:%c\n", name, l, "+-"[p->a[j]>>32&1],
-                        "FAKE", coverage_cut?coverage_cut[x].s:0, coverage_cut?coverage_cut[x].e:(int)Get_READ_LENGTH((*RNF), x), x, '*');
-                }
+#define BGW_MAX 8
+static bgw_t bgw_a[BGW_MAX];
+static int bgw_n = 0, bgw_exit_set = 0;
+
+static void *bgw_run(void *data)
+{
+    bgw_t *w = (bgw_t*)data;
+    if (w->fn) {
+        FILE *fp = fopen(w->fn, "w");
+        if (fp) {
+            fwrite(w->b, 1, w->n, fp);
+            fclose(fp);
+        } else {
+            fprintf(stderr, "[E::%s] cannot open %s\n", __func__, w->fn);
+        }
+    } else {
+        uint64_t k = 0;
+        while (k < w->n) {
+            ssize_t r = pwrite(w->fd, w->b + k, w->n - k, w->off + k);
+            if (r <= 0) {
+                fprintf(stderr, "[E::%s] cannot write %lu bytes at %ld\n", __func__, (unsigned long)(w->n - k), (long)(w->off + k));
+                break;
+            }
+            k += r;
+        }
+        close(w->fd);
+    }
+    free(w->b); free(w->fn);
+    return NULL;
+}
+
+static void bgw_join(void)
+{
+    int i;
+    for (i = 0; i < bgw_n; i++) pthread_join(bgw_a[i].t, NULL);
+    bgw_n = 0;
+}
+
+static void bgw_start(const char *fn, int fd, int64_t off, uint8_t *b, uint64_t n)
+{
+    bgw_t *w;
+    if (!bgw_exit_set) {
+        atexit(bgw_join); bgw_exit_set = 1;
+    }
+    if (bgw_n == BGW_MAX) bgw_join();
+    w = &bgw_a[bgw_n++];
+    w->fn = fn? strdup(fn) : NULL; w->fd = fd; w->off = off; w->b = b; w->n = n;
+    if (pthread_create(&w->t, NULL, bgw_run, w) != 0) {
+        bgw_n--; bgw_run(w);
+    }
+}
+
+///write n bytes of b (malloc'ed; freed after the write) to the file fn in the background
+static void bgw_add(const char *fn, uint8_t *b, uint64_t n)
+{
+    bgw_start(fn, -1, 0, b, n);
+}
+
+///write n bytes of b (malloc'ed; freed after the write) at the current position of fp in the background;
+///fp moves past them, and the later writes to fp go after them. Without a position (a pipe), fwrite().
+static void bgw_add_fp(FILE *fp, uint8_t *b, uint64_t n)
+{
+    int64_t off; int fd;
+    if (n == 0 || fflush(fp) != 0 || (off = ftello(fp)) < 0 || (fd = dup(fileno(fp))) < 0) {
+        if (n) fwrite(b, 1, n, fp);
+        free(b);
+        return;
+    }
+    if (fseeko(fp, off + n, SEEK_SET) != 0) {
+        close(fd); fwrite(b, 1, n, fp); free(b);
+        return;
+    }
+    bgw_start(NULL, fd, off, b, n);
+}
+
+///a growable text buffer for the GFA lines: ug_sprintf() gives the bytes of fprintf()
+typedef struct {
+    size_t l, m; char *s;
+} ug_str_t;
+
+static void ug_sprintf(ug_str_t *o, const char *fmt, ...)
+{
+    va_list ap; int l;
+    va_start(ap, fmt); l = vsnprintf(o->s? o->s + o->l : NULL, o->m - o->l, fmt, ap); va_end(ap);
+    if ((size_t)l + 1 > o->m - o->l) {
+        o->m = o->l + l + 1; o->m += o->m>>1;
+        o->s = (char*)realloc(o->s, o->m);
+        va_start(ap, fmt); vsnprintf(o->s + o->l, o->m - o->l, fmt, ap); va_end(ap);
+    }
+    o->l += l;
+}
+
+///room for n more bytes (and the NUL of vsnprintf())
+static void ug_reserve(ug_str_t *o, size_t n)
+{
+    if (o->l + n + 1 > o->m) {
+        o->m = o->l + n + 1;
+        o->s = (char*)realloc(o->s, o->m);
+    }
+}
+
+///the S and A lines of ma_ug_print2() for the unitigs [i0, i0+n), one text buffer for each, in parallel
+typedef struct {
+    const ma_ug_t *ug; All_reads *RNF; asg_t *read_g; const ma_sub_t *coverage_cut; ma_hit_t_alloc *sources; R_to_U *ruIndex;
+    int print_seq; uint32_t pc, i0; const char *prefix; uint8_t **flag; ug_str_t *out;
+} ug_print_aux_t;
+
+static void ug_print_seg_worker(void *data, long k, int tid)///callback for kt_for()
+{
+    ug_print_aux_t *a = (ug_print_aux_t*)data;
+    All_reads *RNF = a->RNF;
+    const ma_sub_t *coverage_cut = a->coverage_cut;
+    uint32_t i = a->i0 + k, j, l;
+    ma_utg_t *p = &a->ug->u.a[i];
+    ug_str_t *o = &a->out[k];
+    uint8_t *primary_flag;
+    char name[32];
+    o->l = 0;
+    if(p->m == 0) return;
+    ///get_ug_coverage() sets and clears its flags: one flag array for each thread
+    if (a->pc && a->flag[tid] == NULL) a->flag[tid] = (uint8_t*)calloc(a->read_g->n_seq, sizeof(uint8_t));
+    primary_flag = a->flag[tid];
+    sprintf(name, "%s%.6d%c", a->prefix, i + 1, "lc"[p->circ]);
+    if (a->print_seq && p->s) {///the bases with one copy (not 2 vsnprintf() and the growth of the buffer)
+        uint32_t cov = a->pc?get_ug_coverage(p, a->read_g, coverage_cut, a->sources, a->ruIndex, primary_flag, NULL, NULL):0;
+        size_t ls = strlen(p->s);
+        ug_reserve(o, ls + 64 + (size_t)p->n * 160);
+        ug_sprintf(o, "S\t%s\t", name);
+        memcpy(o->s + o->l, p->s, ls); o->l += ls;
+        ug_sprintf(o, "\tLN:i:%d\trd:i:%u\n", p->len, cov);
+    }
+    else if (a->print_seq) ug_sprintf(o, "S\t%s\t%s\tLN:i:%d\trd:i:%u\n", name, p->s? p->s : "*", p->len, 
+    a->pc?get_ug_coverage(p, a->read_g, coverage_cut, a->sources, a->ruIndex, primary_flag, NULL, NULL):0);
+    else ug_sprintf(o, "S\t%s\t*\tLN:i:%d\trd:i:%u\n", name, p->len, 
+    a->pc?get_ug_coverage(p, a->read_g, coverage_cut, a->sources, a->ruIndex, primary_flag, NULL, NULL):0);
+
+    for (j = l = 0; j < p->n; j++) {
+        if(p->a[j] != (uint64_t)-1)
+        {
+            uint32_t x = p->a[j]>>33;
+            if(x<RNF->total_reads)
+            {
+
+                ug_sprintf(o, "A\t%s\t%d\t%c\t%.*s\t%d\t%d\tid:i:%d\tHG:A:%c\n", name, l, "+-"[p->a[j]>>32&1],
+                (int)Get_NAME_LENGTH((*RNF), x), Get_NAME((*RNF), x), 
+                coverage_cut?coverage_cut[x].s:0, coverage_cut?coverage_cut[x].e:(int)Get_READ_LENGTH((*RNF), x), x, 
+                "apmaaa"[((RNF->trio_flag[x]!=FATHER && RNF->trio_flag[x]!=MOTHER)?AMBIGU:RNF->trio_flag[x])]);
             }
             else
             {
-                fprintf(fp, "A\t%s\t%d\t*\t*\t*\t*\tid:i:*\tHG:A:*\n", name, l);
+                ug_sprintf(o, "A\t%s\t%d\t%c\t%s\t%d\t%d\tid:i:%d\tHG:A:%c\n", name, l, "+-"[p->a[j]>>32&1],
+                    "FAKE", coverage_cut?coverage_cut[x].s:0, coverage_cut?coverage_cut[x].e:(int)Get_READ_LENGTH((*RNF), x), x, '*');
             }
-            l += (uint32_t)p->a[j];
         }
+        else
+        {
+            ug_sprintf(o, "A\t%s\t%d\t*\t*\t*\t*\tid:i:*\tHG:A:*\n", name, l);
+        }
+        l += (uint32_t)p->a[j];
+    }
+}
+
+#define UG_PRINT_BATCH 4096
+
+void ma_ug_print2(const ma_ug_t *ug, All_reads *RNF, asg_t* read_g, const ma_sub_t *coverage_cut, 
+ma_hit_t_alloc* sources, R_to_U* ruIndex, int print_seq, const char* prefix, FILE *fp)
+{
+	uint32_t i, j, k, nb, pc = read_g && coverage_cut && sources && ruIndex?1:0, co;
+	int n_thread = asm_opt.thread_num > 0? asm_opt.thread_num : 1;
+	ug_print_aux_t a;
+	ug_str_t all = {0, 0, NULL};
+	///the Segment lines in GFA: formatted in parallel, joined in the order of the unitigs; all the text
+	///is written in the background (bgw_add_fp())
+	a.ug = ug; a.RNF = RNF; a.read_g = read_g; a.coverage_cut = coverage_cut; a.sources = sources; a.ruIndex = ruIndex;
+	a.print_seq = print_seq; a.pc = pc; a.prefix = prefix;
+	a.flag = (uint8_t**)calloc(n_thread, sizeof(uint8_t*));
+	a.out = (ug_str_t*)calloc(UG_PRINT_BATCH, sizeof(ug_str_t));
+	for (i = 0; i < ug->u.n; i += nb) {
+		nb = ug->u.n - i < UG_PRINT_BATCH? ug->u.n - i : UG_PRINT_BATCH;
+		a.i0 = i;
+		kt_for(n_thread, ug_print_seg_worker, &a, nb);
+		for (k = 0; k < nb; k++) {
+			if (a.out[k].l == 0) continue;
+			if (all.l + a.out[k].l > all.m) {
+				all.m = all.l + a.out[k].l; all.m += all.m>>1;
+				all.s = (char*)realloc(all.s, all.m);
+			}
+			memcpy(all.s + all.l, a.out[k].s, a.out[k].l); all.l += a.out[k].l;
+		}
 	}
+	for (k = 0; k < UG_PRINT_BATCH; k++) free(a.out[k].s);
+	for (k = 0; k < (uint32_t)n_thread; k++) free(a.flag[k]);
+	free(a.out); free(a.flag);
 	// for (i = 0; i < ug->g->n_arc; ++i) { // the Link lines in GFA
 	// 	uint32_t u = ug->g->arc[i].ul>>32, v = ug->g->arc[i].v;
 	// 	fprintf(fp, "L\t%s%.6d%c\t%c\t%s%.6d%c\t%c\t%dM\tL1:i:%d\n", 
@@ -11397,10 +11560,10 @@ ma_hit_t_alloc* sources, R_to_U* ruIndex, int print_seq, const char* prefix, FIL
             if(ug->u.a[i].m == 0) continue;
             if(ug->u.a[i].circ) {
                 co = cal_circle_ov(ug, i, 0, read_g);
-                fprintf(fp, "L\t%s%.6dc\t+\t%s%.6dc\t+\t%dM\tL1:i:%d\tL2:i:%u\n", 
+                ug_sprintf(&all, "L\t%s%.6dc\t+\t%s%.6dc\t+\t%dM\tL1:i:%d\tL2:i:%u\n", 
                 prefix, i+1, prefix, i+1, co, ((ug->u.a[i].len>=co)?(ug->u.a[i].len-co):0), 0);
                 co = cal_circle_ov(ug, i, 1, read_g);
-                fprintf(fp, "L\t%s%.6dc\t-\t%s%.6dc\t-\t%dM\tL1:i:%d\tL2:i:%u\n", 
+                ug_sprintf(&all, "L\t%s%.6dc\t-\t%s%.6dc\t-\t%dM\tL1:i:%d\tL2:i:%u\n", 
                 prefix, i+1, prefix, i+1, co, ((ug->u.a[i].len>=co)?(ug->u.a[i].len-co):0), 0);
             } else {
                 u = i<<1;
@@ -11410,7 +11573,7 @@ ma_hit_t_alloc* sources, R_to_U* ruIndex, int print_seq, const char* prefix, FIL
                 {
                     if(au[j].del) continue;
                     v = au[j].v;
-                    fprintf(fp, "L\t%s%.6d%c\t%c\t%s%.6d%c\t%c\t%dM\tL1:i:%d\tL2:i:%u\n", 
+                    ug_sprintf(&all, "L\t%s%.6d%c\t%c\t%s%.6d%c\t%c\t%dM\tL1:i:%d\tL2:i:%u\n", 
                     prefix, (u>>1)+1, "lc"[ug->u.a[u>>1].circ], "+-"[u&1],
                     prefix,	(v>>1)+1, "lc"[ug->u.a[v>>1].circ], "+-"[v&1], au[j].ol, asg_arc_len(au[j]), 0/**au[j].ou**/);
                 }
@@ -11423,14 +11586,14 @@ ma_hit_t_alloc* sources, R_to_U* ruIndex, int print_seq, const char* prefix, FIL
                 {
                     if(au[j].del) continue;
                     v = au[j].v;
-                    fprintf(fp, "L\t%s%.6d%c\t%c\t%s%.6d%c\t%c\t%dM\tL1:i:%d\tL2:i:%u\n", 
+                    ug_sprintf(&all, "L\t%s%.6d%c\t%c\t%s%.6d%c\t%c\t%dM\tL1:i:%d\tL2:i:%u\n", 
                     prefix, (u>>1)+1, "lc"[ug->u.a[u>>1].circ], "+-"[u&1],
                     prefix,	(v>>1)+1, "lc"[ug->u.a[v>>1].circ], "+-"[v&1], au[j].ol, asg_arc_len(au[j]), 0/**au[j].ou**/);
                 }
             } 
         }
     }
-    free(primary_flag);    
+    bgw_add_fp(fp, (uint8_t*)all.s, all.l);
 }
 
 void ma_ug_print(const ma_ug_t *ug, asg_t* read_g, const ma_sub_t *coverage_cut, 
@@ -24031,21 +24194,167 @@ uint32_t load_yak_binning(hifiasm_opt_t *opt, char *ou)///asm_opt
     return 1;
 }
 
+static inline uint8_t *ser_put(uint8_t *p, const void *x, size_t l)
+{
+    memcpy(p, x, l);
+    return p + l;
+}
+
+/**asm.ec.bin, written by a thread straight from the read store (the bytes of write_All_reads() without
+ * asm_opt.is_sc): no copy of the reads (23 GB for HG002 30x). The store must not change until
+ * ha_ec_bin_wait(); the functions that free or rebuild a store call it. The head and the tail (trio_flag,
+ * hom_cov, het_cov: the graph stage changes them) are copied first.**/
+typedef struct {
+    const All_reads *r; char *fn;
+    uint8_t *head, *tail; uint64_t n_head, n_tail;
+    pthread_t t; int on;
+} ec_bgw_t;
+static ec_bgw_t ec_bgw;
+
+static void *ec_bgw_run(void *data)
+{
+    ec_bgw_t *w = (ec_bgw_t*)data;
+    const All_reads *r = w->r;
+    uint64_t i, zero = 0;
+    FILE *fp = fopen(w->fn, "w");
+    if (fp == NULL) {
+        fprintf(stderr, "[E::%s] cannot open %s\n", __func__, w->fn);
+        return NULL;
+    }
+    setvbuf(fp, NULL, _IOFBF, 1<<24);
+    fwrite(w->head, 1, w->n_head, fp);
+    for (i = 0; i < r->total_reads; i++) {
+        if (r->N_site[i] != NULL) fwrite(r->N_site[i], sizeof(r->N_site[i][0]), 1 + r->N_site[i][0], fp);
+        else fwrite(&zero, sizeof(zero), 1, fp);
+    }
+    fwrite(r->read_length, sizeof(uint64_t), r->total_reads, fp);
+    for (i = 0; i < r->total_reads; i++) fwrite(r->read_sperate[i], 1, r->read_length[i]/4+1, fp);
+    fwrite(r->name, 1, r->total_name_length, fp);
+    fwrite(r->name_index, sizeof(uint64_t), r->name_index_size, fp);
+    fwrite(w->tail, 1, w->n_tail, fp);
+    fclose(fp);
+    return NULL;
+}
+
+void ha_ec_bin_wait(void)
+{
+    if (!ec_bgw.on) return;
+    pthread_join(ec_bgw.t, NULL);
+    free(ec_bgw.fn); free(ec_bgw.head); free(ec_bgw.tail);
+    memset(&ec_bgw, 0, sizeof(ec_bgw));
+}
+
+static void ec_bgw_start(const All_reads *r, const char *fn)
+{
+    static int exit_set = 0;
+    uint8_t *p;
+    ha_ec_bin_wait();
+    if (!exit_set) {
+        atexit(ha_ec_bin_wait); exit_set = 1;
+    }
+    ec_bgw.r = r; ec_bgw.fn = strdup(fn);
+    ec_bgw.n_head = sizeof(asm_opt.adapterLen) + sizeof(r->index_size) + sizeof(r->name_index_size) + sizeof(r->total_reads) + sizeof(r->total_reads_bases) + sizeof(r->total_name_length);
+    MALLOC(ec_bgw.head, ec_bgw.n_head);
+    p = ec_bgw.head;
+    p = ser_put(p, &asm_opt.adapterLen, sizeof(asm_opt.adapterLen));
+    p = ser_put(p, &r->index_size, sizeof(r->index_size));
+    p = ser_put(p, &r->name_index_size, sizeof(r->name_index_size));
+    p = ser_put(p, &r->total_reads, sizeof(r->total_reads));
+    p = ser_put(p, &r->total_reads_bases, sizeof(r->total_reads_bases));
+    p = ser_put(p, &r->total_name_length, sizeof(r->total_name_length));
+    ec_bgw.n_tail = r->total_reads + sizeof(asm_opt.hom_cov) + sizeof(asm_opt.het_cov);
+    MALLOC(ec_bgw.tail, ec_bgw.n_tail);
+    p = ec_bgw.tail;
+    p = ser_put(p, r->trio_flag, r->total_reads);
+    p = ser_put(p, &(asm_opt.hom_cov), sizeof(asm_opt.hom_cov));
+    p = ser_put(p, &(asm_opt.het_cov), sizeof(asm_opt.het_cov));
+    ec_bgw.on = 1;
+    if (pthread_create(&ec_bgw.t, NULL, ec_bgw_run, &ec_bgw) != 0) {
+        ec_bgw_run(&ec_bgw);
+        ec_bgw.on = 0; free(ec_bgw.fn); free(ec_bgw.head); free(ec_bgw.tail);
+        memset(&ec_bgw, 0, sizeof(ec_bgw));
+    }
+}
+
+typedef struct {
+    const ma_hit_t_alloc *x; uint8_t *b; const uint64_t *off;
+} ser_hits_t;
+
+static void ser_hits_worker(void *data, long i, int tid)
+{
+    ser_hits_t *s = (ser_hits_t*)data;
+    const ma_hit_t_alloc *x = &s->x[i];
+    uint8_t *p = s->b + s->off[i];
+    uint32_t k, t;
+    p = ser_put(p, &(x->is_fully_corrected), sizeof(x->is_fully_corrected));
+    p = ser_put(p, &(x->is_abnormal), sizeof(x->is_abnormal));
+    p = ser_put(p, &(x->length), sizeof(x->length));
+    for (k = 0; k < x->length; k++) {///the fields of write_ma()
+        const ma_hit_t *h = &x->buffer[k];
+        p = ser_put(p, &(h->qns), sizeof(h->qns));
+        p = ser_put(p, &(h->qe), sizeof(h->qe));
+        p = ser_put(p, &(h->tn), sizeof(h->tn));
+        p = ser_put(p, &(h->ts), sizeof(h->ts));
+        p = ser_put(p, &(h->te), sizeof(h->te));
+        p = ser_put(p, &(h->el), sizeof(h->el));
+        p = ser_put(p, &(h->no_l_indel), sizeof(h->no_l_indel));
+        t = h->ml; p = ser_put(p, &t, sizeof(t));
+        t = h->rev; p = ser_put(p, &t, sizeof(t));
+        t = h->bl; p = ser_put(p, &t, sizeof(t));
+        t = h->del; p = ser_put(p, &t, sizeof(t));
+    }
+}
+
+///the bytes of write_ma_hit_ts() in one buffer of *n bytes; the reads in parallel
+static uint8_t *serialize_ma_hit_ts(const ma_hit_t_alloc *x, long long n_read, uint64_t *n, int n_threads)
+{
+    const uint64_t rec = sizeof(uint64_t) + 4*sizeof(uint32_t) + 2*sizeof(uint8_t) + 4*sizeof(uint32_t);
+    uint64_t *off, tot;
+    long long i;
+    uint8_t *b;
+    ser_hits_t s;
+    MALLOC(off, n_read + 1);
+    tot = sizeof(n_read);
+    for (i = 0; i < n_read; i++) {
+        off[i] = tot;
+        tot += sizeof(x[i].is_fully_corrected) + sizeof(x[i].is_abnormal) + sizeof(x[i].length) + rec*x[i].length;
+    }
+    MALLOC(b, tot);
+    ser_put(b, &n_read, sizeof(n_read));
+    s.x = x; s.b = b; s.off = off;
+    kt_for(n_threads, ser_hits_worker, &s, n_read);
+    free(off);
+    *n = tot;
+    return b;
+}
+
 void write_all_data_to_disk(ma_hit_t_alloc* sources, ma_hit_t_alloc* reverse_sources, All_reads *RNF, char* output_file_name)
 {   
 	char* gfa_name = (char*)malloc(strlen(output_file_name)+25);
+	uint8_t *b; uint64_t n;
 	sprintf(gfa_name, "%s.ec", output_file_name);
-	write_All_reads(RNF, gfa_name);
+	if (asm_opt.is_sc) {
+		write_All_reads(RNF, gfa_name);
+	} else {///the same bytes as write_All_reads(), written in the background from the store
+		fprintf(stderr, "Writing reads to disk... \n");
+		sprintf(gfa_name, "%s.ec.bin", output_file_name); ec_bgw_start(RNF, gfa_name);
+		fprintf(stderr, "Reads has been written.\n");
+	}
 
     if((ha_opt_triobin(&asm_opt)) && (asm_opt.fn_bin_yak[0] && asm_opt.fn_bin_yak[1])) {
         write_yak_binning(asm_opt.output_file_name, asm_opt.fn_bin_yak[0], asm_opt.fn_bin_yak[1]);
     }
 
-	sprintf(gfa_name, "%s.ovlp.source", output_file_name);
-	write_ma_hit_ts(sources, RNF->total_reads, gfa_name);
+	///the same bytes as write_ma_hit_ts(), written in the background
+	fprintf(stderr, "Writing ma_hit_ts to disk... \n");
+	b = serialize_ma_hit_ts(sources, RNF->total_reads, &n, asm_opt.thread_num);
+	sprintf(gfa_name, "%s.ovlp.source.bin", output_file_name); bgw_add(gfa_name, b, n);
+	fprintf(stderr, "ma_hit_ts has been written.\n");
 
-	sprintf(gfa_name, "%s.ovlp.reverse", output_file_name);
-	write_ma_hit_ts(reverse_sources, RNF->total_reads, gfa_name);
+	fprintf(stderr, "Writing ma_hit_ts to disk... \n");
+	b = serialize_ma_hit_ts(reverse_sources, RNF->total_reads, &n, asm_opt.thread_num);
+	sprintf(gfa_name, "%s.ovlp.reverse.bin", output_file_name); bgw_add(gfa_name, b, n);
+	fprintf(stderr, "ma_hit_ts has been written.\n");
 
 	free(gfa_name);
     fprintf(stderr, "bin files have been written.\n");

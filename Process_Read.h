@@ -239,6 +239,7 @@ void write_All_reads(All_reads* r, char* read_file_name);
 int load_All_reads(All_reads* r, char* read_file_name);
 int append_All_reads(All_reads* r, char *idx, uint32_t id);
 void destory_All_reads(All_reads* r);
+void ha_ec_bin_wait(void);///the background write of asm.ec.bin reads the store: call before a store changes
 int destory_read_bin(All_reads* r);
 void init_Debug_reads(Debug_reads* x, const char* file);
 void destory_Debug_reads(Debug_reads* x);

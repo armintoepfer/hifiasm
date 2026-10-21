@@ -46,6 +46,7 @@ void init_All_reads(All_reads* r)
 void destory_All_reads(All_reads* r)
 {
 	uint64_t i = 0;
+	ha_ec_bin_wait();
 	for (i = 0; i < r->total_reads; i++) {
 		if (r->N_site[i]) free(r->N_site[i]);
 		if (r->read_sperate[i]) free(r->read_sperate[i]);
@@ -259,6 +260,7 @@ void read_ma(ma_hit_t* x, FILE* fp)
 
 int append_All_reads(All_reads* r, char *idx, uint32_t id)
 {
+	ha_ec_bin_wait();
 	char *gfa_name = NULL; MALLOC(gfa_name, (strlen(idx)+100));
 	FILE *fp = NULL, *fpo = NULL;
 
@@ -385,6 +387,7 @@ int append_All_reads(All_reads* r, char *idx, uint32_t id)
 
 int destory_read_bin(All_reads* r)
 {
+	ha_ec_bin_wait();
 
 	uint64_t i = 0;
 	for (i = 0; i < r->total_reads; i++)
